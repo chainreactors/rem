@@ -1,5 +1,10 @@
 # rem
 
+blog:  
+  - https://chainreactors.github.io/wiki/blog/2025/04/13/rem-introduce/
+
+![](https://socialify.git.ci/chainreactors/rem-community/image?description=1&font=Inter&forks=1&issues=1&language=1&name=1&owner=1&pattern=Circuit%20Board&pulls=1&stargazers=1&theme=Light)
+
 ## What is it?
 
 rem是全新架构的全场景应用层/传输层代理工具.
@@ -10,6 +15,9 @@ rem是全新架构的全场景应用层/传输层代理工具.
 
 ## Feature
 
+* 支持TCP, UDP, ICMP, HTTP, WebSocket, Wireguard, Unix, SMB, Memory 传输层
+* 支持socks5/socks4, https/http, trojan, shadowsocks, neoreg, suo5 跳转代理
+* 支持socks5/socks4, https/http, trojan, shadowsocks, CobaltStrike external C2 应用层协议
 * 支持任意方向，任意信道的代理与端口转发
 * 支持流量特征自定义与加密方式自定义
 * 极简的命令行设计
@@ -19,37 +27,6 @@ rem是全新架构的全场景应用层/传输层代理工具.
 
 https://chainreactors.github.io/wiki/rem/usage/
 
-## Roadmap
-
-### 第一阶段 重构rem
-
-- [x] 调整主体文件结构
-- [x] 调整函数,文件,变量命名
-- [x] 重构代理逻辑
-- [x] 代码解耦  
-- [x] 重构monitor与流量控制
-- [x] 重新设计cli ui
-- [x] 支持rportfwd 
-- [x] 重新设计msg
-- [x] 重新设计wrapper v0.1.0
-- [x] 支持neoregeorg, 将半双工信道升级为全双工
-- [x] 支持云函数, cdn等 
-- [x] 支持配置任意数量的多级透明socks5/socks4a/socks4/http/https代理
-- [x] 支持tls协议 
-- [x] 支持级联
-- [ ] 支持端口复用(working)
-- [ ] 支持端口敲门(working)
-- [x] RPORTFWD_LOCAL与PORTFWD_LOCAL
-- [x] 重构proxyclient 
-
-**讨论中的高级功能**
-
-- [x] Proxy as a service, 提供一套流量协议标准以及多语言跨平台sdk, 无性能损耗的转发流量 (working)
-- [x] 心跳代理, 使用非长连接的方式建立代理, 实现更复杂的流量与统计学特征混淆
-- [ ] P2P式的多级代理, 类似STUN协议
-- [x] 重载任意C2的listener, 最终目的将listener从C2中解耦出来
-- [x] 实现编译期, 自定义templates. 实现随机流量特征与最小文件体积
-- [ ] 通过ebpf与raw packet实现更高级的信道建立与隐蔽
 
 ## Similar or related works
 
