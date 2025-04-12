@@ -145,7 +145,7 @@ func (l *LimitedConn) Read(p []byte) (n int, err error) {
 	if !GlobalLimiter.IsReadEnabled() {
 		n, err = l.Conn.Read(p)
 		if n > 0 {
-			GlobalLimiter.readCount.Add(int64(n))
+			GlobalLimiter.readCount += int64(n)
 			atomic.AddInt64(&l.ReadCount, int64(n))
 		}
 		return
@@ -156,7 +156,7 @@ func (l *LimitedConn) Read(p []byte) (n int, err error) {
 		if err := GlobalLimiter.readLimiter.WaitN(context.Background(), n); err != nil {
 			return n, err
 		}
-		GlobalLimiter.readCount.Add(int64(n))
+		GlobalLimiter.readCount += int64(n)
 		atomic.AddInt64(&l.ReadCount, int64(n))
 	}
 	return
@@ -166,7 +166,7 @@ func (l *LimitedConn) Write(p []byte) (n int, err error) {
 	if !GlobalLimiter.IsWriteEnabled() {
 		n, err = l.Conn.Write(p)
 		if n > 0 {
-			GlobalLimiter.writeCount.Add(int64(n))
+			GlobalLimiter.writeCount += int64(n)
 			atomic.AddInt64(&l.WriteCount, int64(n))
 		}
 		return
@@ -177,7 +177,7 @@ func (l *LimitedConn) Write(p []byte) (n int, err error) {
 		if err := GlobalLimiter.writeLimiter.WaitN(context.Background(), n); err != nil {
 			return n, err
 		}
-		GlobalLimiter.writeCount.Add(int64(n))
+		GlobalLimiter.writeCount += int64(n)
 		atomic.AddInt64(&l.WriteCount, int64(n))
 	}
 	return

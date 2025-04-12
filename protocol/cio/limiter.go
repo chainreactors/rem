@@ -16,22 +16,25 @@ func init() {
 type Limiter struct {
 	readLimiter  *rate.Limiter
 	writeLimiter *rate.Limiter
-	readEnabled  atomic.Bool  // 读限速开关
-	writeEnabled atomic.Bool  // 写限速开关
-	readCount    atomic.Int64 // 读取计数器
-	writeCount   atomic.Int64 // 写入计数器
+	readEnabled  atomic.Value // 读限速开关
+	writeEnabled atomic.Value // 写限速开关
+	readCount    int64        // 读取计数器
+	writeCount   int64        // 写入计数器
 }
 
 func NewLimiter(readRate, writeRate rate.Limit, burstSize int) *Limiter {
-	return &Limiter{
+	l := &Limiter{
 		readLimiter:  rate.NewLimiter(readRate, burstSize),
 		writeLimiter: rate.NewLimiter(writeRate, burstSize),
 	}
+	l.readEnabled.Store(false)
+	l.writeEnabled.Store(false)
+	return l
 }
 
 // GetCounts 获取读写计数
 func (l *Limiter) GetCounts() (readCount, writeCount int64) {
-	return l.readCount.Load(), l.writeCount.Load()
+	return atomic.LoadInt64(&l.readCount), atomic.LoadInt64(&l.writeCount)
 }
 
 // SetReadRate 设置读取速率
@@ -61,10 +64,10 @@ func (l *Limiter) GetLimits() (readLimit, writeLimit rate.Limit) {
 
 // IsReadEnabled 检查读限速是否启用
 func (l *Limiter) IsReadEnabled() bool {
-	return l.readEnabled.Load()
+	return l.readEnabled.Load().(bool)
 }
 
 // IsWriteEnabled 检查写限速是否启用
 func (l *Limiter) IsWriteEnabled() bool {
-	return l.writeEnabled.Load()
+	return l.writeEnabled.Load().(bool)
 }
