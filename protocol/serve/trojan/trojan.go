@@ -35,8 +35,7 @@ func NewTrojanOutbound(options map[string]string, dial core.ContextDialer) (core
 		trojanx.WithDial(dial.DialContext),
 	)
 	base := core.NewPluginOption(options, core.OutboundPlugin, core.TrojanServe)
-	utils.Log.Importantf("[agent.outbound] trojan serving: %s", base.String())
-	utils.Log.Importantf("[agent.outbound] %s", base.URL())
+	utils.Log.Importantf("[agent.outbound] trojan serving: %s, %s", base.String(), base.URL())
 	return &TrojanPlugin{Server: server, PluginOption: base}, nil
 }
 
@@ -54,8 +53,7 @@ func NewTrojanInbound(options map[string]string) (core.Inbound, error) {
 		}),
 	)
 	base := core.NewPluginOption(options, core.InboundPlugin, core.TrojanServe)
-	utils.Log.Importantf("[agent.inbound] trojan serving: %s", base.String())
-	utils.Log.Importantf("[agent.inbound] %s", base.URL())
+	utils.Log.Importantf("[agent.inbound] trojan serving: %s , %s", base.String(), base.URL())
 	return &TrojanPlugin{Server: server, PluginOption: base}, nil
 }
 

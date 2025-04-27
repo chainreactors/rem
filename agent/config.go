@@ -28,6 +28,8 @@ type Config struct {
 	Proxies    []*url.URL
 	Params     map[string]string
 	Interfaces []string
+	Username   string
+	Hostname   string
 	Controller *message.Control
 }
 

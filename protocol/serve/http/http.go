@@ -36,8 +36,7 @@ func NewHTTPProxyInbound(options map[string]string) (core.Inbound, error) {
 	hp := &HTTPProxy{
 		PluginOption: core.NewPluginOption(options, core.InboundPlugin, core.HTTPServe),
 	}
-	utils.Log.Importantf("[agent.inbound] http serving: %s", hp.String())
-	utils.Log.Importantf("[agent.inbound] %s", hp.URL())
+	utils.Log.Importantf("[agent.inbound] http serving: %s , %s", hp.String(), hp.URL())
 	return hp, nil
 }
 

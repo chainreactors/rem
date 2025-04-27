@@ -157,8 +157,7 @@ func NewShadowSocksOutbound(options map[string]string, dial core.ContextDialer) 
 		return nil, err
 	}
 	base := core.NewPluginOption(options, core.OutboundPlugin, core.ShadowSocksServe)
-	utils.Log.Importantf("[agent.inbound] shadowsocks serving: %s", base.String())
-	utils.Log.Importantf("[agent.inbound] %s", base.URL())
+	utils.Log.Importantf("[agent.inbound] shadowsocks serving: %s , %s", base.String(), base.URL())
 	return &ShadowSocksPlugin{Server: cipher, PluginOption: base, dial: dial}, nil
 
 }
@@ -176,8 +175,7 @@ func NewShadowSocksInbound(options map[string]string) (core.Inbound, error) {
 		return nil, err
 	}
 	base := core.NewPluginOption(options, core.InboundPlugin, core.ShadowSocksServe)
-	utils.Log.Importantf("[agent.inbound] shadowsocks serving: %s", base.String())
-	utils.Log.Importantf("[agent.inbound] %s", base.URL())
+	utils.Log.Importantf("[agent.inbound] shadowsocks serving: %s, %s", base.String(), base.URL())
 	return &ShadowSocksPlugin{Server: cipher, PluginOption: base}, nil
 }
 

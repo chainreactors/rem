@@ -3,7 +3,7 @@ package runner
 import (
 	"fmt"
 	"github.com/chainreactors/logs"
-	"github.com/chainreactors/rem/x/proxyclient"
+	"github.com/chainreactors/proxyclient"
 	"net/http"
 	"net/url"
 	"testing"

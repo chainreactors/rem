@@ -11,6 +11,8 @@ message Login {
     string Token    = 5;
     string Agent = 8;
     repeated string Interfaces = 9;
+    string Hostname = 10;
+    string Username = 11;
     string Wrapper  = 13;
 }
 

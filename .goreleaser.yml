@@ -43,7 +43,7 @@ builds:
     no_unique_dist_dir: true
     tags:
       - forceposix
-
+      
 upx:
   -
     enabled: true

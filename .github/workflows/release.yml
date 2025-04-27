@@ -8,7 +8,7 @@ on:
 
 jobs:
   goreleaser:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     environment: release
     env:
       EDITION: ${{ vars.EDITION || 'community' }}
@@ -125,7 +125,7 @@ jobs:
       - name: Zip files
         run: |
           zip -r -j dist/rem_archive.zip dist/rem*
-          zip -r dist/rem_lib.zip dist/lib/
+          zip -r dist/rem_lib.zip dist/lib/ -x "*.h"
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2

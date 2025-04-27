@@ -14,9 +14,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/agent"
 	"github.com/chainreactors/rem/runner"
-	"github.com/chainreactors/rem/x/proxyclient"
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/kballard/go-shellquote"
 )

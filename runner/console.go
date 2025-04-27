@@ -7,17 +7,19 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/user"
 	"strings"
 	"time"
 
 	"github.com/chainreactors/logs"
+	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/agent"
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/protocol/tunnel"
 	_ "github.com/chainreactors/rem/protocol/tunnel/memory"
-	"github.com/chainreactors/rem/x/proxyclient"
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/kballard/go-shellquote"
 	"gopkg.in/yaml.v3"
@@ -29,7 +31,7 @@ func init() {
 
 // 实现 DialFactory 函数
 func newRemProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (proxyclient.Dial, error) {
-	return func(network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		memoryPipe := utils.RandomString(8)
 		console, err := NewConsoleWithCMD(fmt.Sprintf("-c %s -m proxy -l memory+socks5://:@%s", proxyURL.String(), memoryPipe))
 		a, err := console.Dial(&core.URL{URL: proxyURL})
@@ -59,7 +61,7 @@ func newRemProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (proxyc
 		if err != nil {
 			return nil, err
 		}
-		return memClient.Dial(network, address)
+		return memClient(ctx, network, address)
 	}, nil
 }
 
@@ -168,10 +170,11 @@ func (c *Console) Run() error {
 		for i := 0; i <= c.Config.Retry; i++ {
 			age, err := c.Dial(c.ConsoleURL)
 			if err != nil {
-				return err
+				utils.Log.Error(err)
+				time.Sleep(time.Duration(c.Config.RetryInterval) * time.Second)
+				continue
 			}
 			c.Handler(age)
-			time.Sleep(time.Duration(c.Config.RetryInterval) * time.Second)
 			utils.Log.Infof("Reconnect to server, %d ", i)
 		}
 	}
@@ -213,6 +216,16 @@ func (c *Console) Bind() error {
 }
 
 func (c *Console) newAgent(urls *core.URLs, r *RunnerConfig) (*agent.Agent, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+
+	username, err := user.Current()
+	if err != nil {
+		return nil, err
+	}
+
 	return agent.NewAgent(&agent.Config{
 		Type: core.CLIENT,
 		Mod:  r.Mod,
@@ -229,6 +242,8 @@ func (c *Console) newAgent(urls *core.URLs, r *RunnerConfig) (*agent.Agent, erro
 			"ip":   r.IP,
 			"name": utils.GenerateHostHash()[:24],
 		},
+		Username: username.Username,
+		Hostname: hostname,
 	})
 }
 
@@ -356,6 +371,8 @@ func (c *Console) Accept() (*agent.Agent, error) {
 		Redirect:   control.Destination,
 		ExternalIP: c.Config.IP,
 		Interfaces: login.Interfaces,
+		Hostname:   login.Hostname,
+		Username:   login.Username,
 		Controller: control,
 		URLs: &core.URLs{
 			ConsoleURL: login.ConsoleURL(),
@@ -365,6 +382,7 @@ func (c *Console) Accept() (*agent.Agent, error) {
 		Params: control.Options,
 	})
 	server.Conn = conn
+	utils.Log.Importantf("%s:%s %s connected from %s, iface: %v", server.Hostname, server.Username, server.Name(), conn.RemoteAddr().String(), server.Interfaces)
 	agent.Agents.Add(server)
 	return server, nil
 }

@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/chainreactors/logs"
+	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
-	"github.com/chainreactors/rem/x/proxyclient"
 	"github.com/chainreactors/rem/x/utils"
 	"google.golang.org/protobuf/proto"
 )
@@ -197,6 +197,8 @@ func (agent *Agent) Login(conn net.Conn) error {
 		Mod:          agent.Mod,
 		Token:        hex.EncodeToString(token),
 		Interfaces:   agent.Interfaces,
+		Hostname:     agent.Hostname,
+		Username:     agent.Username,
 	})
 	if err != nil {
 		return err
@@ -505,7 +507,7 @@ func (agent *Agent) Close(err error) {
 }
 
 func (agent *Agent) Log(part string, level logs.Level, msg string, s ...interface{}) {
-	utils.Log.FLogf(agent.log, level, "[%s.%s] %s", agent.Type, part, fmt.Sprintf(msg, s...))
+	utils.Log.FLogf(agent.log, level, "[%s.%s.%s] %s", agent.Type, agent.ID, part, fmt.Sprintf(msg, s...))
 }
 
 func (agent *Agent) Metrics() string {

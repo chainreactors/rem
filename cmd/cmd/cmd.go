@@ -1,15 +1,15 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
-	"os"
-	"strings"
-
 	"github.com/chainreactors/logs"
 	"github.com/chainreactors/rem/runner"
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/jessevdk/go-flags"
 	"github.com/kballard/go-shellquote"
+	"os"
+	"time"
 )
 
 var ver = ""
@@ -39,21 +39,27 @@ func RUN() {
 		
 `
 	var args []string
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		buffer := make([]byte, 4096)
-		n, err := os.Stdin.Read(buffer)
+	reader := bufio.NewReader(os.Stdin)
+	ch := make(chan string)
+
+	go func() {
+		data, _ := reader.ReadString('\n')
+		ch <- data
+	}()
+
+	select {
+	case input := <-ch:
+		split, err := shellquote.Split(input)
 		if err != nil {
-			fmt.Println(err)
+			logs.Log.Error(err)
 			return
 		}
-		args, err = shellquote.Split(strings.TrimSpace(string(buffer[:n])))
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	} else {
-		args = os.Args
+		args = split
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if len(args) == 0 {
+		args = os.Args[1:]
 	}
 
 	_, err := parser.ParseArgs(args)

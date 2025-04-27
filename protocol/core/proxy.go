@@ -2,7 +2,7 @@ package core
 
 import (
 	"context"
-	"github.com/chainreactors/rem/x/proxyclient"
+	"github.com/chainreactors/proxyclient"
 	"net"
 )
 

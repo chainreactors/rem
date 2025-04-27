@@ -7,10 +7,10 @@ import (
 	"net"
 	"net/url"
 
+	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/wrapper"
-	"github.com/chainreactors/rem/x/proxyclient"
 	"github.com/chainreactors/rem/x/utils"
 )
 

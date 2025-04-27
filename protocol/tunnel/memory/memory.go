@@ -7,9 +7,9 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/chainreactors/proxyclient"
+	socksproxy "github.com/chainreactors/proxyclient/socks"
 	"github.com/chainreactors/rem/protocol/core"
-	"github.com/chainreactors/rem/x/proxyclient"
-	socksproxy "github.com/chainreactors/rem/x/proxyclient/socks"
 )
 
 var (
@@ -31,12 +31,12 @@ func init() {
 
 // 实现 DialFactory 函数
 func newMemoryProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (proxyclient.Dial, error) {
-	return func(network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		// 首先获取内存通道连接
 		dialer := &MemoryDialer{meta: make(core.Metas)}
 
 		conf := &socksproxy.SOCKSConf{
-			Dial: func(_, _ string) (net.Conn, error) {
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return dialer.Dial(proxyURL.Host)
 			},
 		}
@@ -46,7 +46,7 @@ func newMemoryProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (pro
 			return nil, err
 		}
 
-		return client.Dial(network, address)
+		return client.Dial(ctx, network, address)
 	}, nil
 }
 

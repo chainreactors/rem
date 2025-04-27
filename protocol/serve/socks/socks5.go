@@ -72,8 +72,7 @@ func NewSocksInbound(params map[string]string) (core.Inbound, error) {
 		return nil, err
 	}
 	base := core.NewPluginOption(params, core.InboundPlugin, core.Socks5Serve)
-	utils.Log.Importantf("[agent.inbound] Socks5 serving: %s", base.String())
-	utils.Log.Importantf("[agent.inbound] %s", base.URL())
+	utils.Log.Importantf("[agent.inbound] Socks5 serving: %s , %s", base.String(), base.URL())
 	return &Socks5Plugin{Server: server, PluginOption: base}, nil
 }
 
@@ -95,8 +94,7 @@ func NewSocks5Outbound(params map[string]string, dialer core.ContextDialer) (cor
 	}
 
 	base := core.NewPluginOption(params, core.OutboundPlugin, core.Socks5Serve)
-	utils.Log.Importantf("[agent.outbound] Socks5 serving: %s", base.String())
-	utils.Log.Importantf("[agent.outbound] %s", base.URL())
+	utils.Log.Importantf("[agent.outbound] Socks5 serving: %s , %s", base.String(), base.URL())
 	return &Socks5Plugin{
 		Server:       server,
 		PluginOption: base,

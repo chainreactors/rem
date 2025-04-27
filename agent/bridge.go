@@ -104,7 +104,7 @@ func (b *Bridge) Handler(agent *Agent) {
 		go func() {
 			outbound, err := agent.Outbound.Handle(b, agent.Conn)
 			if err != nil {
-				b.Log("outbound", logs.ErrorLevel, "%s", err.Error())
+				b.Log("outbound", logs.DebugLevel, "error %s", err.Error())
 				return
 			}
 			b.remote = cio.NewLimitedConn(outbound)
@@ -117,7 +117,7 @@ func (b *Bridge) Handler(agent *Agent) {
 		go func() {
 			inbound, err := agent.Inbound.Relay(b.remote, b)
 			if err != nil {
-				b.Log("inbound", logs.ErrorLevel, "%s", err.Error())
+				b.Log("inbound", logs.DebugLevel, "error %s", err.Error())
 				b.Close()
 				return
 			}
