@@ -46,4 +46,8 @@ require (
 	gvisor.dev/gvisor v0.0.0-20221203005347-703fd9b7fbc0 // indirect
 )
 
-replace github.com/chainreactors/proxyclient => github.com/chainreactors/proxyclient v1.0.3
+replace (
+	github.com/chainreactors/proxyclient => github.com/chainreactors/proxyclient v1.0.3
+	golang.org/x/crypto => golang.org/x/crypto v0.24.0
+	golang.org/x/net => golang.org/x/net v0.23.0
+)
