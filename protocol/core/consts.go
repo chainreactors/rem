@@ -4,6 +4,7 @@ var (
 	MaxPacketSize = 1024 * 128
 	DefaultKey    = "nonenonenonenone"
 
+	DefaultScheme       = "default"
 	DefaultConsoleProto = "tcp"
 	DefaultConsolePort  = "34996"
 	DefaultUsername     = "remno1"

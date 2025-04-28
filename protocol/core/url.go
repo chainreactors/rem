@@ -42,7 +42,7 @@ func NewConsoleURL(u string) (*URL, error) {
 
 func NewURL(u string) (*URL, error) {
 	if !strings.Contains(u, "://") {
-		u = "raw://" + u
+		u = DefaultScheme + "://" + u
 	}
 
 	parsed, err := url.Parse(u)

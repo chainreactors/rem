@@ -100,17 +100,6 @@ func GenerateMachineHash() string {
 	return fmt.Sprintf("%x", hashBytes)
 }
 
-// 根据 MAC 地址生成机器唯一哈希
-func GenerateHostHash() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "unknown-" + RandomString(32)
-	}
-
-	// 返回生成的哈希值
-	return hostname + "-" + GenerateMachineHash()
-}
-
 func GetLocalSubnet() []string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

@@ -87,10 +87,6 @@ func (opt *Options) Prepare() (*RunnerConfig, error) {
 		r.ConsoleURLs = append(r.ConsoleURLs, conURL)
 	}
 
-	if r.RemoteAddr == "" && r.LocalAddr == "" {
-		r.RemoteAddr = "socks5://"
-	}
-
 	r.URLs.RemoteURL, err = core.NewURL(opt.RemoteAddr)
 	if err != nil {
 		return nil, err
@@ -108,20 +104,20 @@ func (opt *Options) Prepare() (*RunnerConfig, error) {
 		if r.URLs.RemoteURL.Port() == "0" {
 			r.URLs.RemoteURL.SetPort(utils.RandPort())
 		}
-		if r.URLs.RemoteURL.Scheme == "" {
+		if r.URLs.RemoteURL.Scheme == core.DefaultScheme {
 			r.URLs.RemoteURL.Scheme = core.Socks5Serve
 		}
-		if r.URLs.LocalURL.Scheme == "" {
+		if r.URLs.LocalURL.Scheme == core.DefaultScheme {
 			r.URLs.LocalURL.Scheme = core.RawServe
 		}
 	} else if r.Mod == core.Proxy {
 		if r.URLs.LocalURL.Port() == "0" {
 			r.URLs.LocalURL.SetPort(utils.RandPort())
 		}
-		if r.URLs.RemoteURL.Scheme == "" {
+		if r.URLs.RemoteURL.Scheme == core.DefaultScheme {
 			r.URLs.RemoteURL.Scheme = core.RawServe
 		}
-		if r.URLs.LocalURL.Scheme == "" {
+		if r.URLs.LocalURL.Scheme == core.DefaultScheme {
 			r.URLs.LocalURL.Scheme = core.Socks5Serve
 		}
 	}

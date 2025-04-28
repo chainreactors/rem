@@ -358,8 +358,8 @@ func (agent *Agent) handlerControl(control *message.Control) error {
 	}
 
 	if agent.Type == core.SERVER && agent.Mod == core.Proxy {
-		inboundURL := local.Copy()
-		inboundURL.SetHostname(control.Options["ip"])
+		inboundURL := remote.Copy()
+		inboundURL.SetHostname(agent.Hostname)
 		logs.Log.Importantf("[agent.inbound] remote inbound serbing: %s", inboundURL.String())
 	}
 

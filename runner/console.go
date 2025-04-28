@@ -240,7 +240,7 @@ func (c *Console) newAgent(urls *core.URLs, r *RunnerConfig) (*agent.Agent, erro
 		Interfaces: utils.GetLocalSubnet(),
 		Params: map[string]string{
 			"ip":   r.IP,
-			"name": utils.GenerateHostHash()[:24],
+			"name": (hostname + "-" + utils.GenerateMachineHash())[:24],
 		},
 		Username: username.Username,
 		Hostname: hostname,
