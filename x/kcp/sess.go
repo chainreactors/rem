@@ -1108,7 +1108,7 @@ func ListenWithOptions(network, address string, block BlockCrypt, dataShards, pa
 	switch network {
 	case "udp", "udp4", "udp6":
 		conn, err = net.ListenPacket(network, address)
-	case "ip4:icmp", "ip6:ipv6-icmp":
+	case "icmp", "ip4:icmp", "ip6:ipv6-icmp":
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, errors.WithStack(err)

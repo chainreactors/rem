@@ -100,10 +100,10 @@ func (bp *Buffer) processLoop() {
 			if n > 0 {
 				bp.curSize -= int64(n)
 			}
+			PutBuf(data)
 			if err != nil {
 				continue
 			}
-			PutBuf(data)
 		}
 	}
 }
@@ -121,19 +121,19 @@ func (bp *Buffer) Write(p []byte) (n int, err error) {
 			return n, err
 		}
 		return n, nil
+	} else {
+		data := GetBuf(len(p))
+		copy(data, p)
+
+		err = bp.writeOne(data)
+		if err != nil {
+			PutBuf(data)
+			return 0, err
+		}
+
+		bp.curSize += int64(len(p))
+		return len(p), nil
 	}
-
-	data := GetBuf(len(p))
-	copy(data, p)
-
-	err = bp.writeOne(data)
-	if err != nil {
-		PutBuf(data)
-		return 0, err
-	}
-
-	bp.curSize += int64(len(p))
-	return len(p), nil
 }
 
 func (bp *Buffer) writeChunks(p []byte) (n int, err error) {

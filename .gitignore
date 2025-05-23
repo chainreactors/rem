@@ -17,6 +17,5 @@
 # vendor/
 .idea/
 /bin
-dist/
-
+/dist
 

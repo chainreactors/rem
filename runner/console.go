@@ -205,11 +205,12 @@ func (c *Console) Bind() error {
 			return err
 		}
 		go func() {
-			_, err := plug.Handle(conn, conn)
+			wrapped, err := plug.Handle(conn, conn)
 			if err != nil {
 				utils.Log.Error(err)
 				return
 			}
+			cio.Join(wrapped, conn)
 		}()
 	}
 	return nil

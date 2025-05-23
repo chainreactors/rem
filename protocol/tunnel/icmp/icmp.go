@@ -44,11 +44,13 @@ func (c *ICMPListener) Addr() net.Addr {
 }
 
 func (c *ICMPDialer) Dial(dst string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(dst)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := kcp.DialWithOptions("icmp", host, nil, 0, 0)
+	u, _ := core.NewURL(dst)
+	c.meta["url"] = u
+	//host, _, err := net.SplitHostPort(dst)
+	//if err != nil {
+	//	return nil, err
+	//}
+	conn, err := kcp.DialWithOptions(parseICMPNetwork(u.Hostname()), u.Host, nil, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +58,9 @@ func (c *ICMPDialer) Dial(dst string) (net.Conn, error) {
 }
 
 func (c *ICMPListener) Listen(dst string) (net.Listener, error) {
-	lsn, err := kcp.ListenWithOptions("icmp", "0.0.0.0", nil, 0, 0)
+	u, _ := core.NewURL(dst)
+	c.meta["url"] = u
+	lsn, err := kcp.ListenWithOptions(parseICMPNetwork(u.Hostname()), u.Host, nil, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -80,4 +84,13 @@ func (c *ICMPListener) Close() error {
 		return c.listener.Close()
 	}
 	return nil
+}
+
+func parseICMPNetwork(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+
+	if ip.To4() != nil {
+		return "ip4:icmp"
+	}
+	return "ip6:ipv6-icmp"
 }

@@ -1009,7 +1009,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	return 0
 }
 
-// NoDelay options33
+// NoDelay options
 // fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
 // nodelay: 0:disable(default), 1:enable
 // interval: internal update timer interval in millisec, default is 100ms

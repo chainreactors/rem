@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
-	"github.com/chainreactors/logs"
 	"io"
 	"math/big"
 	"math/rand"
@@ -19,11 +18,12 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/chainreactors/logs"
 )
 
 var (
-	DefaultHTTPInternal = 100        // milliseconds
-	DefaultHTTPMaxBody  = 128 * 1024 // 128k
+	DefaultHTTPMaxBody = 128 * 1024 // 128k
 )
 
 func ResolveHTTPAddr(network, address string) (*SimplexAddr, error) {
@@ -34,7 +34,7 @@ func ResolveHTTPAddr(network, address string) (*SimplexAddr, error) {
 	var interval, maxSize int
 	iv := u.Query().Get("internal")
 	if iv == "" {
-		interval = DefaultHTTPInternal
+		interval = DefaultSimplexInternal
 	} else {
 		interval, err = strconv.Atoi(iv)
 		if err != nil {
@@ -192,9 +192,6 @@ func (c *httpClient) Send(p []byte, addr *SimplexAddr) (int, error) {
 			if err != nil {
 				return
 			}
-			//if len(p) > 0 {
-			//	logs.Log.Debugf("send %d bytes to %s", len(p), addr.String())
-			//}
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				respData, err := io.ReadAll(resp.Body)

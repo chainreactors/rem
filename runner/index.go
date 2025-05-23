@@ -18,6 +18,7 @@ import (
 
 // transport
 import (
+	_ "github.com/chainreactors/rem/protocol/tunnel/http"
 	_ "github.com/chainreactors/rem/protocol/tunnel/tcp"
 	_ "github.com/chainreactors/rem/protocol/tunnel/udp"
 	//_ "github.com/chainreactors/rem/protocol/tunnel/unix"

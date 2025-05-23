@@ -13,6 +13,11 @@ import (
 	"github.com/chainreactors/logs"
 )
 
+var (
+	DefaultSimplexInternal    = 100 // 最大发包间隔(毫秒)
+	DefaultSimplexMinInternal = 10  // 最小发包间隔(毫秒)
+)
+
 type Simplex interface {
 	Receive() (p []byte, addr *SimplexAddr, err error)
 
@@ -222,17 +227,32 @@ func (c *SimplexClient) SetReadDeadline(t time.Time) error  { return nil }
 func (c *SimplexClient) SetWriteDeadline(t time.Time) error { return nil }
 
 func (c *SimplexClient) polling() {
-	sendTicker := time.NewTicker(c.addr.internal)
 	recvTicker := time.NewTicker(c.addr.internal)
+	sendTicker := time.NewTicker(c.addr.internal)
+	lastSendTime := time.Now()
+
 	go func() {
 		for {
 			select {
 			case <-c.ctx.Done():
 				return
 			case <-sendTicker.C:
-				// 序列化数据
 				body := c.buffer.marshal()
 				c.Send(body, c.addr)
+				lastSendTime = time.Now()
+			default:
+				// 检查是否有数据需要发送
+				now := time.Now()
+				if now.Sub(lastSendTime) < time.Duration(DefaultSimplexMinInternal)*time.Millisecond {
+					time.Sleep(time.Duration(DefaultSimplexMinInternal) * time.Millisecond)
+					continue
+				}
+
+				body := c.buffer.marshal()
+				if body != nil {
+					c.Send(body, c.addr)
+					lastSendTime = now
+				}
 			}
 		}
 	}()

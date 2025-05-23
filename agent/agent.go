@@ -378,11 +378,13 @@ func (agent *Agent) handleMessage() error {
 			}
 			switch m := msg.Message.(type) {
 			case *message.Pong:
+				agent.Log("pong", logs.DebugLevel, "pong %s", m.Pong)
 			case *message.Ping:
+				agent.Log("ping", logs.DebugLevel, "ping %s", m.Ping)
 				pmsg := &message.Pong{
 					Pong: "pong",
 				}
-				err := agent.sendCh.Send(0, pmsg)
+				err := agent.Send(pmsg)
 				if err != nil {
 					return err
 				}
@@ -413,6 +415,7 @@ func (agent *Agent) handleMessage() error {
 					default:
 						if _, err := bridge.buf.Write(m.Data); err != nil {
 							bridge.Log("write", logs.DebugLevel, "bridge %d write failed: %v", m.ID, err)
+							bridge.Close()
 						} else {
 							bridge.recvSum += int64(len(m.Data))
 						}

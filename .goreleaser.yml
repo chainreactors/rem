@@ -41,9 +41,13 @@ builds:
     gcflags:
       - all=-trimpath={{.Env.GOPATH}}
     no_unique_dist_dir: true
+    env:
+      - CGO_ENABLED=0
     tags:
       - forceposix
-      
+      - osusergo
+      - netgo
+
 upx:
   -
     enabled: true
@@ -73,5 +77,5 @@ release:
   skip_upload: true
   github:
     owner: chainreactors
-    name: rem-community
+    name: rem
   draft: true

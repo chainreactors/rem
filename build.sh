@@ -36,7 +36,7 @@ TMP_FILE="runner/index.go.tmp"
 
 # 生成新的index.go文件
 cat > "$TMP_FILE" << 'EOF'
-package cmd
+package runner
 
 // basic
 import (

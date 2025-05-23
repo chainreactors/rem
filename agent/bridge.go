@@ -3,12 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
-	"github.com/chainreactors/rem/protocol/core"
 	"net"
 	"time"
 
 	"github.com/chainreactors/logs"
 	"github.com/chainreactors/rem/protocol/cio"
+	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/x/utils"
 	"google.golang.org/protobuf/proto"

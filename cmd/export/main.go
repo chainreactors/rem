@@ -6,7 +6,6 @@ package main
 */
 import "C"
 import (
-	"github.com/chainreactors/logs"
 	"io"
 	"net"
 	"net/url"
@@ -14,11 +13,22 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/chainreactors/logs"
 	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/agent"
 	"github.com/chainreactors/rem/runner"
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/kballard/go-shellquote"
+)
+
+const (
+	// RemDial 错误码
+	ErrCmdParseFailed  = 1 // Command line parsing error
+	ErrArgsParseFailed = 2 // Parameter parsing error
+	ErrPrepareFailed   = 3 // Preparation failed
+	ErrNoConsoleURL    = 4 // No console URL
+	ErrCreateConsole   = 5 // Failed to create console
+	ErrDialFailed      = 6 // Connection failed
 )
 
 var (
@@ -37,11 +47,11 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 	var option runner.Options
 	args, err := shellquote.Split(C.GoString(cmdline))
 	if err != nil {
-		return nil, 1 // 错误ID 1: 命令行解析错误
+		return nil, ErrCmdParseFailed
 	}
 	err = option.ParseArgs(args)
 	if err != nil {
-		return nil, 2 // 错误ID 2: 参数解析错误
+		return nil, ErrArgsParseFailed
 	}
 
 	if option.Debug {
@@ -56,11 +66,11 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 	r, err := option.Prepare()
 	if err != nil {
 		utils.Log.Debugf("RemDial error: failed to prepare options: %v", err)
-		return nil, 3 // 错误ID 3: 准备失败
+		return nil, ErrPrepareFailed
 	}
 	if len(r.ConsoleURLs) == 0 {
 		utils.Log.Debug("RemDial error: no console URL provided")
-		return nil, 4 // 错误ID 4: 无控制台URL
+		return nil, ErrNoConsoleURL
 	}
 
 	conURL := r.ConsoleURLs[0]
@@ -68,13 +78,13 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 	console, err := runner.NewConsole(r, r.NewURLs(conURL))
 	if err != nil {
 		utils.Log.Debugf("RemDial error: failed to create console: %v", err)
-		return nil, 5 // 错误ID 5: 创建控制台失败
+		return nil, ErrCreateConsole
 	}
 
 	a, err := console.Dial(console.ConsoleURL)
 	if err != nil {
 		utils.Log.Debugf("RemDial error: failed to dial console: %v", err)
-		return nil, 6 // 错误ID 6: 连接失败
+		return nil, ErrDialFailed
 	}
 
 	// 启动一个新的goroutine来处理agent
@@ -106,13 +116,13 @@ func MemoryDial(memhandle *C.char, dst *C.char) (C.int, C.int) {
 	memClient, err := proxyclient.NewClient(memURL)
 	if err != nil {
 		utils.Log.Debugf("MemoryDial error: failed to create memory client: %v", err)
-		return 0, 1 // 错误ID 1: 创建客户端失败
+		return 0, ErrCreateConsole
 	}
 
 	conn, err := memClient.Dial("tcp", C.GoString(dst))
 	if err != nil {
 		utils.Log.Debugf("MemoryDial error: failed to dial destination: %v", err)
-		return 0, 2 // 错误ID 2: 连接失败
+		return 0, ErrDialFailed
 	}
 
 	connHandle := int(utils.RandomString(1)[0])
@@ -125,14 +135,14 @@ func MemoryRead(chandle C.int, buf unsafe.Pointer, size C.int) (C.int, C.int) {
 	conn, ok := conns.Load(int(chandle))
 	if !ok {
 		utils.Log.Debugf("MemoryRead error: invalid handle: %d", chandle)
-		return 0, 1 // 错误ID 1: 无效的连接句柄
+		return 0, ErrArgsParseFailed
 	}
 
 	buffer := make([]byte, int(size))
 	n, err := conn.(net.Conn).Read(buffer)
 	if err != nil && err != io.EOF {
 		utils.Log.Debugf("MemoryRead error: failed to read: %v", err)
-		return 0, 2 // 错误ID 2: 读取错误
+		return 0, ErrDialFailed
 	}
 
 	if n > 0 {
@@ -148,7 +158,7 @@ func MemoryWrite(chandle C.int, buf unsafe.Pointer, size C.int) (C.int, C.int) {
 	conn, ok := conns.Load(int(chandle))
 	if !ok {
 		utils.Log.Debugf("MemoryWrite error: invalid handle: %d", chandle)
-		return 0, 1 // 错误ID 1: 无效的连接句柄
+		return 0, ErrArgsParseFailed
 	}
 
 	buffer := make([]byte, int(size))
@@ -158,7 +168,7 @@ func MemoryWrite(chandle C.int, buf unsafe.Pointer, size C.int) (C.int, C.int) {
 	n, err := conn.(net.Conn).Write(buffer)
 	if err != nil {
 		utils.Log.Debugf("MemoryWrite error: failed to write: %v", err)
-		return 0, 2 // 错误ID 2: 写入错误
+		return 0, ErrDialFailed
 	}
 
 	return C.int(n), 0
@@ -169,13 +179,13 @@ func MemoryClose(chandle C.int) C.int {
 	conn, ok := conns.Load(int(chandle))
 	if !ok {
 		utils.Log.Debugf("MemoryClose error: invalid handle: %d", chandle)
-		return 1 // 错误ID 1: 无效的连接句柄
+		return ErrArgsParseFailed
 	}
 
 	err := conn.(net.Conn).Close()
 	if err != nil {
 		utils.Log.Debugf("MemoryClose error: failed to close connection: %v", err)
-		return 2 // 错误ID 2: 关闭错误
+		return ErrDialFailed
 	}
 
 	conns.Delete(int(chandle))

@@ -1,12 +1,12 @@
 package cio
 
 import (
-	"bytes"
 	"encoding/binary"
 	"google.golang.org/protobuf/proto"
 	"io"
 	"net"
 
+	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/x/utils"
 )
@@ -42,11 +42,11 @@ func pack(msg proto.Message) ([]byte, error) {
 		return nil, message.WrapError(message.ErrMarshal, err.Error())
 	}
 
-	var bs bytes.Buffer
-	bs.WriteByte(byte(msgType))
-	binary.Write(&bs, binary.LittleEndian, uint32(len(content)))
-	bs.Write(content)
-	return bs.Bytes(), nil
+	buf := GetBuf(1 + 4 + len(content))
+	buf[0] = byte(msgType)
+	binary.LittleEndian.PutUint32(buf[1:5], uint32(len(content)))
+	copy(buf[5:], content)
+	return buf, nil
 }
 
 func WriteMsg(conn net.Conn, msg proto.Message) error {
@@ -58,12 +58,19 @@ func WriteMsg(conn net.Conn, msg proto.Message) error {
 	utils.Log.Logf(utils.IOLog, "[write] %s to %s, %d bytes\n",
 		conn.LocalAddr().String(), conn.RemoteAddr().String(), len(packedmsg))
 	utils.Log.Logf(utils.DUMPLog, "[write] %v", packedmsg)
-	_, err = conn.Write(packedmsg)
+	n, err := conn.Write(packedmsg)
+	if n != len(packedmsg) {
+		utils.Log.Debugf("write error, %s", err.Error())
+		return message.WrapError(message.ErrConnectionError,
+			"write %d bytes, expected %d bytes", n, len(packedmsg))
+	}
 	return err
 }
 
 func ReadMsg(conn net.Conn) (proto.Message, error) {
-	header := make([]byte, 5)
+	header := GetBuf(5)
+	defer PutBuf(header)
+
 	_, err := io.ReadFull(conn, header)
 	if err != nil {
 		utils.Log.Logf(utils.IOLog, "[read] %s from %s: read greet error, %s\n",
@@ -72,11 +79,23 @@ func ReadMsg(conn net.Conn) (proto.Message, error) {
 	}
 
 	mtype := message.MsgType(header[0])
+	if int(mtype) >= int(message.End) {
+		return nil, message.WrapError(message.ErrInvalidType,
+			"invalid message type %d", header[0])
+	}
+
 	length := binary.LittleEndian.Uint32(header[1:5])
+	if int(length) > core.MaxPacketSize {
+		return nil, message.WrapError(message.ErrMessageLength,
+			"message length %d exceeds max size %d", length, core.MaxPacketSize)
+	}
+
 	utils.Log.Logf(utils.IOLog, "[read] %s from %s, %d bytes \n",
 		conn.RemoteAddr().String(), conn.LocalAddr().String(), length)
 
-	bs := make([]byte, length)
+	bs := GetBuf(int(length))
+	defer PutBuf(bs)
+
 	n, err := io.ReadFull(conn, bs)
 	if err != nil {
 		return nil, message.WrapError(message.ErrConnectionError, err.Error())
