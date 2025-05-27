@@ -54,6 +54,9 @@ func (l *Listener) defaultMonitor() {
 	buf := make([]byte, mtuLimit)
 	for {
 		if n, from, err := l.conn.ReadFrom(buf); err == nil {
+			if n == 0 {
+				return
+			}
 			l.packetInput(buf[:n], from)
 		} else {
 			l.notifyReadError(errors.WithStack(err))

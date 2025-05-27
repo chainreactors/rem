@@ -136,8 +136,11 @@ func WithProxyClient(proxyAddr []string) TunnelOption {
 				if err != nil {
 					return nil, err
 				}
-
-				conn, err := proxy.Dial("tcp", dst)
+				u, err := core.NewURL(dst)
+				if err != nil {
+					return nil, err
+				}
+				conn, err := proxy.Dial(u.Scheme, u.Host)
 				if err != nil {
 					return nil, err
 				}

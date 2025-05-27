@@ -48,6 +48,9 @@ func newSimplexBuffer(addr *SimplexAddr) *simplexBuffer {
 
 // 从buffer中读取所有数据并序列化
 func (b *simplexBuffer) marshal() []byte {
+	if len(b.ctrlChan) == 0 && b.writeBuf.Size() == 0 {
+		return nil
+	}
 	var ctrlBufs [][]byte
 	var ctrlTotalLen int
 	for {
@@ -293,6 +296,7 @@ func (c *SimplexServer) polling() {
 		default:
 			p, addr, err := c.Receive()
 			if err != nil || len(p) == 0 {
+				time.Sleep(time.Duration(DefaultSimplexMinInternal/2) * time.Millisecond)
 				continue
 			}
 			buf := c.GetBuffer(addr)
