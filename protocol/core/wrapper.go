@@ -1,13 +1,17 @@
+//go:build !tinygo
+
 package core
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
+	"sync"
 
+	"github.com/chainreactors/rem/x/cryptor"
 	"github.com/chainreactors/rem/x/utils"
-	"gopkg.in/yaml.v3"
 )
 
 var AvailableWrappers []string
@@ -18,13 +22,13 @@ func ParseWrapperOptions(s string, key string) (WrapperOptions, error) {
 		return nil, err
 	}
 
-	decryptedData, err := utils.AesDecrypt(decodedData, utils.PKCS7Padding([]byte(key), 16))
+	decryptedData, err := cryptor.AesDecrypt(decodedData, cryptor.PKCS7Padding([]byte(key), 16))
 	if err != nil {
 		return nil, err
 	}
 
 	var options WrapperOptions
-	err = yaml.Unmarshal(decryptedData, &options)
+	err = json.Unmarshal(decryptedData, &options)
 	if err != nil {
 		return nil, err
 	}
@@ -35,14 +39,14 @@ func ParseWrapperOptions(s string, key string) (WrapperOptions, error) {
 type WrapperOptions []*WrapperOption
 
 func (opts WrapperOptions) String(key string) string {
-	marshal, err := yaml.Marshal(opts)
+	marshal, err := json.Marshal(opts)
 	if err != nil {
-		utils.Log.Error(err)
+		utils.Log.Error(err.Error())
 		return ""
 	}
-	data, err := utils.AesEncrypt(marshal, utils.PKCS7Padding([]byte(key), 16))
+	data, err := cryptor.AesEncrypt(marshal, cryptor.PKCS7Padding([]byte(key), 16))
 	if err != nil {
-		utils.Log.Error(err)
+		utils.Log.Error(err.Error())
 		return ""
 	}
 
@@ -51,8 +55,8 @@ func (opts WrapperOptions) String(key string) string {
 
 // WrapperOption 定义wrapper的基本配置结构
 type WrapperOption struct {
-	Name    string            `yaml:"name"`
-	Options map[string]string `yaml:"options"`
+	Name    string            `json:"name"`
+	Options map[string]string `json:"options"`
 }
 
 // Wrapper 定义了数据包装器的基本接口
@@ -64,22 +68,33 @@ type Wrapper interface {
 // WrapperCreatorFn 是创建wrapper的工厂函数类型
 type WrapperCreatorFn func(r io.Reader, w io.Writer, opt map[string]string) (Wrapper, error)
 
-var wrapperCreators = make(map[string]WrapperCreatorFn)
+// Use sync.Map to survive TinyGo WASM package-level variable corruption.
+var wrapperCreators sync.Map // map[string]WrapperCreatorFn
 
 // WrapperRegister 注册一个wrapper类型
 func WrapperRegister(name string, fn WrapperCreatorFn) {
-	if _, exist := wrapperCreators[name]; exist {
-		panic(fmt.Sprintf("wrapper [%s] is already registered", name))
+	if _, loaded := wrapperCreators.LoadOrStore(name, fn); loaded {
+		wrapperCreators.Store(name, fn)
 	}
-	wrapperCreators[name] = fn
 }
 
 // WrapperCreate 创建一个指定类型的wrapper
 func WrapperCreate(name string, r io.Reader, w io.Writer, opt map[string]string) (Wrapper, error) {
-	if fn, ok := wrapperCreators[name]; ok {
-		return fn(r, w, opt)
+	if fn, ok := wrapperCreators.Load(name); ok {
+		return fn.(WrapperCreatorFn)(r, w, opt)
 	}
-	return nil, fmt.Errorf("wrapper [%s] is not registered", name)
+	available := GetRegisteredWrappers()
+	return nil, fmt.Errorf("wrapper [%s] is not registered. Available wrappers: %v", name, available)
+}
+
+// GetRegisteredWrappers 获取所有已注册的 wrapper 名称
+func GetRegisteredWrappers() []string {
+	var names []string
+	wrapperCreators.Range(func(key, value interface{}) bool {
+		names = append(names, key.(string))
+		return true
+	})
+	return names
 }
 
 // GenerateRandomWrapperOption 生成单个随机的WrapperOption
@@ -92,10 +107,12 @@ func GenerateRandomWrapperOption() *WrapperOption {
 	}
 
 	switch name {
-	case AESWrapper:
-		opt.Options["key"] = utils.RandomString(32)
-		opt.Options["iv"] = utils.RandomString(16)
-	case XORWrapper:
+	case CryptorWrapper:
+		algo := "aes"
+		if rand.Intn(2) == 1 {
+			algo = "xor"
+		}
+		opt.Options["algo"] = algo
 		opt.Options["key"] = utils.RandomString(32)
 		opt.Options["iv"] = utils.RandomString(16)
 	}

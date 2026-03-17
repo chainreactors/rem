@@ -22,7 +22,7 @@ type Reader struct {
 
 func NewReader(conn io.Reader) *Reader {
 	return &Reader{
-		Buffer: NewBuffer(core.MaxPacketSize),
+		Buffer: NewBuffer(core.MaxBufferSize),
 		Reader: bufio.NewReader(conn),
 	}
 }

@@ -8,6 +8,7 @@ import (
 )
 
 var (
+	bufPool32k sync.Pool
 	bufPool16k sync.Pool
 	bufPool5k  sync.Pool
 	bufPool2k  sync.Pool
@@ -17,7 +18,9 @@ var (
 
 func GetBuf(size int) []byte {
 	var x interface{}
-	if size >= 16*1024 {
+	if size >= 32*1024 {
+		x = bufPool32k.Get()
+	} else if size >= 16*1024 {
 		x = bufPool16k.Get()
 	} else if size >= 5*1024 {
 		x = bufPool5k.Get()
@@ -40,7 +43,9 @@ func GetBuf(size int) []byte {
 
 func PutBuf(buf []byte) {
 	size := cap(buf)
-	if size >= 16*1024 {
+	if size >= 32*1024 {
+		bufPool32k.Put(buf)
+	} else if size >= 16*1024 {
 		bufPool16k.Put(buf)
 	} else if size >= 5*1024 {
 		bufPool5k.Put(buf)
@@ -55,7 +60,6 @@ func PutBuf(buf []byte) {
 
 // Buffer is a non-thread-safe buffer with pipe
 type Buffer struct {
-	curSize    int64
 	WriteCount int64
 	ReadCount  int64
 	dataCh     chan []byte
@@ -63,26 +67,27 @@ type Buffer struct {
 	pipeW      *io.PipeWriter
 	ctx        context.Context
 	cancel     context.CancelFunc
-	maxBuf     int
+	cur        int64
+	max        int64
 	chunkSize  int
 	closed     int32 // 0 表示 false, 1 表示 true
 }
 
-func NewBuffer(maxBufSize int) *Buffer {
+func NewBuffer(maxBufSize int64) *Buffer {
 	return NewBufferContext(context.Background(), maxBufSize)
 }
 
-func NewBufferContext(ctx context.Context, maxBufSize int) *Buffer {
+func NewBufferContext(ctx context.Context, maxBufSize int64) *Buffer {
 	pipeR, pipeW := io.Pipe()
 	ctx, cancel := context.WithCancel(ctx)
 	bp := &Buffer{
-		dataCh:    make(chan []byte, 1024),
+		dataCh:    make(chan []byte, 100),
 		pipeR:     pipeR,
 		pipeW:     pipeW,
 		ctx:       ctx,
 		cancel:    cancel,
-		maxBuf:    maxBufSize,
-		chunkSize: maxBufSize / 10,
+		max:       maxBufSize,
+		chunkSize: int(maxBufSize / 100),
 	}
 	go bp.processLoop()
 	return bp
@@ -98,7 +103,7 @@ func (bp *Buffer) processLoop() {
 		case data := <-bp.dataCh:
 			n, err := bp.pipeW.Write(data)
 			if n > 0 {
-				bp.curSize -= int64(n)
+				bp.cur -= int64(n)
 			}
 			PutBuf(data)
 			if err != nil {
@@ -131,7 +136,7 @@ func (bp *Buffer) Write(p []byte) (n int, err error) {
 			return 0, err
 		}
 
-		bp.curSize += int64(len(p))
+		bp.cur += int64(len(p))
 		return len(p), nil
 	}
 }
@@ -151,7 +156,7 @@ func (bp *Buffer) writeChunks(p []byte) (n int, err error) {
 			PutBuf(chunk)
 			return i, err
 		}
-		bp.curSize += int64(end - i)
+		bp.cur += int64(end - i)
 	}
 	return total, nil
 }
@@ -163,6 +168,10 @@ func (bp *Buffer) writeOne(p []byte) error {
 	case <-bp.ctx.Done():
 		return io.ErrClosedPipe
 	}
+}
+
+func (bp *Buffer) Percentage() float32 {
+	return float32(bp.cur) / float32(bp.max)
 }
 
 func (bp *Buffer) Read(p []byte) (n int, err error) {
@@ -184,6 +193,6 @@ func (bp *Buffer) Close() error {
 	return nil
 }
 
-func (bp *Buffer) Size() int {
-	return int(bp.curSize)
+func (bp *Buffer) Size() int64 {
+	return bp.cur
 }

@@ -2,9 +2,11 @@ package core
 
 import (
 	"fmt"
-	"github.com/chainreactors/rem/x/utils"
 	"io"
 	"net"
+	"sync"
+
+	"github.com/chainreactors/rem/x/utils"
 )
 
 type Outbound interface {
@@ -15,23 +17,33 @@ type Outbound interface {
 	ToClash() *utils.Proxies
 }
 
-var outBoundCreators = make(map[string]OutboundCreatorFn)
+// Use sync.Map to survive TinyGo WASM package-level variable corruption.
+var outboundCreators sync.Map // map[string]OutboundCreatorFn
 
 // params has prefix "plugin_"
 type OutboundCreatorFn func(options map[string]string, dial ContextDialer) (Outbound, error)
 
 func OutboundRegister(name string, fn OutboundCreatorFn) {
-	if _, exist := outBoundCreators[name]; exist {
-		panic(fmt.Sprintf("plugin [%s] is already registered", name))
+	if _, loaded := outboundCreators.LoadOrStore(name, fn); loaded {
+		outboundCreators.Store(name, fn)
 	}
-	outBoundCreators[name] = fn
 }
 
 func OutboundCreate(name string, options map[string]string, dialer ContextDialer) (p Outbound, err error) {
-	if fn, ok := outBoundCreators[name]; ok {
-		p, err = fn(options, dialer)
-	} else {
-		err = fmt.Errorf("plugin [%s] is not registered", name)
+	if fn, ok := outboundCreators.Load(name); ok {
+		return fn.(OutboundCreatorFn)(options, dialer)
 	}
+	available := GetRegisteredOutbounds()
+	err = fmt.Errorf("outbound [%s] is not registered. Available outbounds: %v", name, available)
 	return
+}
+
+// GetRegisteredOutbounds 获取所有已注册的 outbound 名称
+func GetRegisteredOutbounds() []string {
+	var names []string
+	outboundCreators.Range(func(key, value interface{}) bool {
+		names = append(names, key.(string))
+		return true
+	})
+	return names
 }

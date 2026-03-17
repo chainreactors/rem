@@ -137,7 +137,7 @@ type segment struct {
 	data     []byte
 }
 
-// encode a segment into buffer
+// encode a segment into buf
 func (seg *segment) encode(ptr []byte) []byte {
 	ptr = ikcp_encode32u(ptr, seg.conv)
 	ptr = ikcp_encode8u(ptr, seg.cmd)
@@ -252,7 +252,7 @@ func (kcp *KCP) PeekSize() (length int) {
 //
 // Return -1 when there is no readable data.
 //
-// Return -2 if len(buffer) is smaller than kcp.PeekSize().
+// Return -2 if len(buf) is smaller than kcp.PeekSize().
 func (kcp *KCP) Recv(buffer []byte) (n int) {
 	peeksize := kcp.PeekSize()
 	if peeksize < 0 {
@@ -697,7 +697,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		}
 	}
 
-	// flush bytes in buffer if there is any
+	// flush bytes in buf if there is any
 	flushBuffer := func() {
 		size := len(buffer) - len(ptr)
 		if size > 0 {
@@ -1012,7 +1012,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 // NoDelay options
 // fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
 // nodelay: 0:disable(default), 1:enable
-// interval: internal update timer interval in millisec, default is 100ms
+// interval: interval update timer interval in millisec, default is 100ms
 // resend: 0:disable fast resend(default), 1:enable fast resend
 // nc: 0:normal congestion control(default), 1:disable congestion control
 func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {

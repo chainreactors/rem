@@ -28,6 +28,7 @@ type PaddingWrapper struct {
 	genLength   func(p []byte) []byte
 	suffix      []byte
 	prefix      []byte
+	pending     bytes.Buffer
 }
 
 func NewPaddingWrapper(r io.Reader, w io.Writer, opt map[string]string) core.Wrapper {
@@ -54,30 +55,32 @@ func (w *PaddingWrapper) Name() string {
 }
 
 func (w *PaddingWrapper) Fill() error {
-	err := w.reader.PeekAndRead(w.prefix)
-	if err != nil {
+	if err := w.reader.PeekAndRead(w.prefix); err != nil {
 		return err
 	}
 	n, err := w.parseLength(w.reader)
 	if err != nil {
 		return err
 	}
-	err = w.reader.FillN(int64(n))
-	if err != nil {
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(w.reader.Reader, payload); err != nil {
 		return err
 	}
-
-	return w.reader.PeekAndRead(w.suffix)
+	if err := w.reader.PeekAndRead(w.suffix); err != nil {
+		return err
+	}
+	w.pending.Reset()
+	_, _ = w.pending.Write(payload)
+	return nil
 }
 
 func (w *PaddingWrapper) Read(p []byte) (n int, err error) {
-	if w.reader.Buffer.Size() == 0 {
-		err = w.Fill()
-		if err != nil {
+	if w.pending.Len() == 0 {
+		if err := w.Fill(); err != nil {
 			return 0, err
 		}
 	}
-	return w.reader.Read(p)
+	return w.pending.Read(p)
 }
 
 func (w *PaddingWrapper) Write(p []byte) (n int, err error) {

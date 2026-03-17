@@ -2,9 +2,11 @@ package core
 
 import (
 	"fmt"
-	"github.com/chainreactors/rem/x/utils"
 	"io"
 	"net"
+	"sync"
+
+	"github.com/chainreactors/rem/x/utils"
 )
 
 type Inbound interface {
@@ -13,31 +15,45 @@ type Inbound interface {
 	ToClash() *utils.Proxies
 }
 
-var inboundCreators = make(map[string]InboundCreatorFn)
+// Use sync.Map to survive TinyGo WASM package-level variable corruption.
+var inboundCreators sync.Map // map[string]InboundCreatorFn
 
 // params has prefix "relay_"
 type InboundCreatorFn func(options map[string]string) (Inbound, error)
 
 func InboundRegister(name string, fn InboundCreatorFn) {
-	if _, exist := inboundCreators[name]; exist {
-		panic(fmt.Sprintf("relay [%s] is already registered", name))
+	if _, loaded := inboundCreators.LoadOrStore(name, fn); loaded {
+		inboundCreators.Store(name, fn)
 	}
-	inboundCreators[name] = fn
 }
 
 func InboundCreate(name string, options map[string]string) (p Inbound, err error) {
-	if fn, ok := inboundCreators[name]; ok {
-		p, err = fn(options)
-	} else {
-		err = fmt.Errorf("relay [%s] is not registered", name)
+	if fn, ok := inboundCreators.Load(name); ok {
+		return fn.(InboundCreatorFn)(options)
 	}
+	available := GetRegisteredInbounds()
+	err = fmt.Errorf("inbound [%s] is not registered. Available inbounds: %v", name, available)
 	return
 }
 
+// GetRegisteredInbounds 获取所有已注册的 inbound 名称
+func GetRegisteredInbounds() []string {
+	var names []string
+	inboundCreators.Range(func(key, value interface{}) bool {
+		names = append(names, key.(string))
+		return true
+	})
+	return names
+}
+
 func NewPluginOption(options map[string]string, mod, typ string) *PluginOption {
+	if options == nil {
+		options = make(map[string]string)
+	}
 	options["type"] = typ
 	return &PluginOption{
 		options: options,
+		Mod:     mod,
 		Proxy:   utils.NewProxies(options),
 	}
 }

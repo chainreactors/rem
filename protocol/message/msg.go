@@ -3,7 +3,6 @@ package message
 import (
 	"fmt"
 	"github.com/chainreactors/rem/x/utils"
-	"google.golang.org/protobuf/proto"
 )
 
 // MsgType 定义消息类型
@@ -26,6 +25,10 @@ const (
 	ConnStartMsg
 	ConnEndMsg
 	RedirectMsg
+	CWNDMsg
+	BridgeOpenMsg
+	BridgeCloseMsg
+	ReconfigureMsg
 	End
 )
 
@@ -42,27 +45,39 @@ var (
 	ErrConnectionError = fmt.Errorf("connection error")
 )
 
-// msgRegistry 存储消息类型到消息创建函数的映射
-var msgRegistry = map[MsgType]func() proto.Message{
-	LoginMsg:     func() proto.Message { return &Login{} },
-	AckMsg:       func() proto.Message { return &Ack{} },
-	ControlMsg:   func() proto.Message { return &Control{} },
-	PingMsg:      func() proto.Message { return &Ping{} },
-	PongMsg:      func() proto.Message { return &Pong{} },
-	PacketMsg:    func() proto.Message { return &Packet{} },
-	ConnStartMsg: func() proto.Message { return &ConnStart{} },
-	ConnEndMsg: func() proto.Message {
-		return &ConnEnd{}
-	},
-	RedirectMsg: func() proto.Message { return &Redirect{} },
-}
-
 // NewMessage 根据消息类型创建新的消息实例
-func NewMessage(msgType MsgType) proto.Message {
-	if creator, ok := msgRegistry[msgType]; ok {
-		return creator()
+// 使用 switch 而非 map，避免 TinyGo WASM 中 map key 损坏问题
+func NewMessage(msgType MsgType) Message {
+	switch msgType {
+	case LoginMsg:
+		return &Login{}
+	case AckMsg:
+		return &Ack{}
+	case ControlMsg:
+		return &Control{}
+	case PingMsg:
+		return &Ping{}
+	case PongMsg:
+		return &Pong{}
+	case PacketMsg:
+		return &Packet{}
+	case ConnStartMsg:
+		return &ConnStart{}
+	case ConnEndMsg:
+		return &ConnEnd{}
+	case RedirectMsg:
+		return &Redirect{}
+	case CWNDMsg:
+		return &CWND{}
+	case BridgeOpenMsg:
+		return &BridgeOpen{}
+	case BridgeCloseMsg:
+		return &BridgeClose{}
+	case ReconfigureMsg:
+		return &Reconfigure{}
+	default:
+		return nil
 	}
-	return nil
 }
 
 // ValidateMessageType 验证消息类型是否有效
@@ -79,7 +94,7 @@ func WrapError(err error, format string, args ...interface{}) error {
 }
 
 // GetMessageType 根据消息实例获取消息类型
-func GetMessageType(msg proto.Message) MsgType {
+func GetMessageType(msg Message) MsgType {
 	if msg == nil {
 		return 0
 	}
@@ -103,12 +118,20 @@ func GetMessageType(msg proto.Message) MsgType {
 		return ConnEndMsg
 	case *Redirect:
 		return RedirectMsg
+	case *CWND:
+		return CWNDMsg
+	case *BridgeOpen:
+		return BridgeOpenMsg
+	case *BridgeClose:
+		return BridgeCloseMsg
+	case *Reconfigure:
+		return ReconfigureMsg
 	default:
 		return 0
 	}
 }
 
-func Wrap(src, dst string, m proto.Message) *Redirect {
+func Wrap(src, dst string, m Message) *Redirect {
 	msg := &Redirect{
 		Source:      src,
 		Destination: dst,
@@ -120,14 +143,17 @@ func Wrap(src, dst string, m proto.Message) *Redirect {
 		msg.Msg = &Redirect_Start{Start: m.(*ConnStart)}
 	case *ConnEnd:
 		msg.Msg = &Redirect_End{End: m.(*ConnEnd)}
+	case *CWND:
+		msg.Msg = &Redirect_Cwnd{Cwnd: m.(*CWND)}
+
 	default:
 		utils.Log.Error(ErrInvalidType)
 	}
 	return msg
 }
 
-func Unwrap(m *Redirect) proto.Message {
-	var msg proto.Message
+func Unwrap(m *Redirect) Message {
+	var msg Message
 	switch m.GetMsg().(type) {
 	case *Redirect_Packet:
 		msg = m.GetPacket()
@@ -135,6 +161,8 @@ func Unwrap(m *Redirect) proto.Message {
 		msg = m.GetStart()
 	case *Redirect_End:
 		msg = m.GetEnd()
+	case *Redirect_Cwnd:
+		msg = m.GetCwnd()
 	default:
 		utils.Log.Error(ErrInvalidType)
 	}

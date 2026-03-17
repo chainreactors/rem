@@ -207,3 +207,11 @@ func (op *TunnelService) Addr() net.Addr {
 	}
 	return nil
 }
+
+// Meta returns a value from the tunnel's metadata map.
+func (op *TunnelService) Meta(key string) interface{} {
+	if op.meta != nil {
+		return op.meta[key]
+	}
+	return nil
+}

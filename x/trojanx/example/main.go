@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"github.com/chainreactors/rem/x/trojanx"
+	"github.com/chainreactors/rem/x/xtls"
 	"github.com/sirupsen/logrus"
 	"log"
 	"net"
@@ -34,13 +35,13 @@ func main() {
 		}
 	}()
 
-	signed, _ := generateSelfSigned()
+	signed := xtls.NewRandomTLSKeyPair()
 	config := &trojanx.TrojanConfig{
 		Password: "password",
 		TLSConfig: &trojanx.TLSConfig{
 			MinVersion:  tls.VersionTLS13,
 			MaxVersion:  tls.VersionTLS13,
-			Certificate: signed,
+			Certificate: *signed,
 		},
 		ReverseProxyConfig: &trojanx.ReverseProxyConfig{
 			Scheme: "http",

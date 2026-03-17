@@ -2,114 +2,39 @@ package runner
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"os/user"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chainreactors/logs"
-	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/agent"
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/protocol/tunnel"
-	_ "github.com/chainreactors/rem/protocol/tunnel/memory"
 	"github.com/chainreactors/rem/x/utils"
-	"github.com/kballard/go-shellquote"
-	"gopkg.in/yaml.v3"
 )
-
-func init() {
-	proxyclient.RegisterScheme("REM", newRemProxyClient)
-}
-
-// 实现 DialFactory 函数
-func newRemProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (proxyclient.Dial, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		memoryPipe := utils.RandomString(8)
-		console, err := NewConsoleWithCMD(fmt.Sprintf("-c %s -m proxy -l memory+socks5://:@%s", proxyURL.String(), memoryPipe))
-		a, err := console.Dial(&core.URL{URL: proxyURL})
-		if err != nil {
-			return nil, err
-		}
-		go func() {
-			err := a.Handler()
-			if err != nil {
-				a.Log("handler", logs.ErrorLevel, "%s", err.Error())
-				return
-			}
-		}()
-
-		for {
-			if a.Init {
-				break
-			} else {
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-		memURL := &url.URL{
-			Scheme: "memory",
-			Host:   memoryPipe,
-		}
-		memClient, err := proxyclient.NewClient(memURL)
-		if err != nil {
-			return nil, err
-		}
-		return memClient(ctx, network, address)
-	}, nil
-}
-
-func NewConsoleWithCMD(cmdline string) (*Console, error) {
-	var option Options
-	args, err := shellquote.Split(cmdline)
-	err = option.ParseArgs(args)
-	if err != nil {
-		return nil, err
-	}
-	runner, err := option.Prepare()
-	if err != nil {
-		return nil, err
-	}
-
-	runner.URLs.ConsoleURL = runner.ConsoleURLs[0]
-	console, err := NewConsole(runner, runner.URLs)
-	if err != nil {
-		return nil, err
-	}
-	return console, nil
-}
 
 func NewConsole(runner *RunnerConfig, urls *core.URLs) (*Console, error) {
 	var err error
 	console := &Console{
-		URLs:   urls,
-		Config: runner,
+		URLs:    urls,
+		Config:  runner,
+		pending: make(map[string]*pendingPair),
 	}
 
-	token, err := utils.AesEncrypt([]byte(runner.Key), utils.PKCS7Padding([]byte(runner.Key), 16))
+	token, err := buildConsoleToken(runner.Key)
 	if err != nil {
 		return nil, err
 	}
-	console.token = hex.EncodeToString(token)
-	isServer := console.IsServer()
-	tunOpts := []tunnel.TunnelOption{}
-	if console.ConsoleURL.GetQuery("tls") != "" {
-		tunOpts = append(tunOpts, tunnel.WithTLS())
-	}
-	if console.ConsoleURL.GetQuery("tlsintls") != "" {
-		tunOpts = append(tunOpts, tunnel.WithTLSInTLS())
-	}
-	if len(runner.ForwardAddr) > 0 {
-		tunOpts = append(tunOpts, tunnel.WithProxyClient(runner.ForwardAddr))
-	}
-	if console.ConsoleURL.GetQuery("compress") != "" {
-		tunOpts = append(tunOpts, tunnel.WithCompression())
+	console.token = token
+	isServer := console.Config.IsServerMode
+	tunOpts, err := buildAdvancedTunnelOptions(console, runner)
+	if err != nil {
+		return nil, err
 	}
 	var wrapperOpts core.WrapperOptions
 	if wrapperStr := console.ConsoleURL.GetQuery("wrapper"); wrapperStr != "" {
@@ -120,7 +45,7 @@ func NewConsole(runner *RunnerConfig, urls *core.URLs) (*Console, error) {
 			}
 		}
 	} else {
-		wrapperOpts = core.GenerateRandomWrapperOptions(2, 4)
+		wrapperOpts = defaultWrapperOptions()
 	}
 
 	if wrapperOpts != nil {
@@ -128,7 +53,7 @@ func NewConsole(runner *RunnerConfig, urls *core.URLs) (*Console, error) {
 		tunOpts = append(tunOpts, tunnel.WithWrappers(isServer, wrapperOpts))
 	}
 
-	console.tunnel, err = tunnel.NewTunnel(context.Background(), console.ConsoleURL.Scheme, isServer, tunOpts...)
+	console.tunnel, err = tunnel.NewTunnel(context.Background(), console.ConsoleURL.Tunnel, isServer, tunOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -142,18 +67,39 @@ type Console struct {
 	sub    *core.URL
 	tunnel *tunnel.TunnelService
 	closed bool
+
+	pendingMu sync.Mutex
+	pending   map[string]*pendingPair
+
+	pendingReaperOnce sync.Once
+	pendingStopOnce   sync.Once
+	pendingStop       chan struct{}
+	pendingDone       chan struct{}
 }
 
-func (c *Console) IsServer() bool {
-	return c.ConsoleURL.Hostname() == "0.0.0.0"
+type pendingConn struct {
+	conn  net.Conn
+	login *message.Login
 }
+
+type pendingPair struct {
+	createdAt time.Time
+	up        pendingConn
+	down      pendingConn
+}
+
+const (
+	pendingPairTTL      = 30 * time.Second
+	pendingReapInterval = 2 * time.Second
+)
 
 func (c *Console) Run() error {
-	if c.IsServer() {
+	if c.Config.IsServerMode {
 		err := c.Listen(c.ConsoleURL)
 		if err != nil {
 			return err
 		}
+		c.startPendingReaper()
 
 		utils.Log.Importantf("%s channel starting with %s", c.ConsoleURL.Scheme, c.Config.IP)
 		utils.Log.Important(c.Link())
@@ -163,89 +109,49 @@ func (c *Console) Run() error {
 				utils.Log.Error(err.Error())
 				continue
 			}
+			if age == nil {
+				continue // half-channel waiting for pair
+			}
 
 			go c.Handler(age)
 		}
 	} else {
-		for i := 0; i <= c.Config.Retry; i++ {
+		backoff := time.Duration(c.Config.RetryInterval) * time.Second
+		maxBackoff := time.Duration(c.Config.RetryMaxInterval) * time.Second
+		consecutiveDialFailures := 0
+
+		for {
 			age, err := c.Dial(c.ConsoleURL)
 			if err != nil {
-				utils.Log.Error(err)
-				time.Sleep(time.Duration(c.Config.RetryInterval) * time.Second)
+				consecutiveDialFailures++
+				// Retry > 0: give up after N consecutive dial failures.
+				// Retry <= 0 (default): never give up.
+				if c.Config.Retry > 0 && consecutiveDialFailures > c.Config.Retry {
+					utils.Log.Errorf("[dial] %d consecutive failures, giving up", consecutiveDialFailures)
+					break
+				}
+				// jitter: ±25%
+				jitter := time.Duration(rand.Int63n(int64(backoff/2))) - backoff/4
+				sleep := backoff + jitter
+				utils.Log.Errorf("[dial] %s, retry after %v (%d failures)", err.Error(), sleep, consecutiveDialFailures)
+				time.Sleep(sleep)
+				// exponential backoff, double but cap at max
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 				continue
 			}
+			// connected successfully — reset backoff and failure counter
+			backoff = time.Duration(c.Config.RetryInterval) * time.Second
+			consecutiveDialFailures = 0
 			c.Handler(age)
-			utils.Log.Infof("Reconnect to server, %d ", i)
+			utils.Log.Infof("handler exited, reconnecting...")
+			// Give the old agent time to fully clean up before creating a new one
+			time.Sleep(1 * time.Second)
 		}
 	}
 	return nil
-}
-
-func (c *Console) Bind() error {
-	client, err := proxyclient.NewClientChain(c.Config.Proxies)
-	if err != nil {
-		return nil
-	}
-	if c.LocalURL.Port() == "0" {
-		c.LocalURL.SetPort(utils.RandPort())
-	}
-	plug, err := core.OutboundCreate(c.LocalURL.Scheme, map[string]string{
-		"username": c.LocalURL.Username(),
-		"password": c.LocalURL.Password(),
-		"server":   c.Config.IP,
-		"port":     c.LocalURL.Port(),
-	}, core.NewProxyDialer(client))
-	listen, err := net.Listen("tcp", c.LocalURL.Host)
-	if err != nil {
-		return err
-	}
-	for {
-		conn, err := listen.Accept()
-		if err != nil {
-			return err
-		}
-		go func() {
-			wrapped, err := plug.Handle(conn, conn)
-			if err != nil {
-				utils.Log.Error(err)
-				return
-			}
-			cio.Join(wrapped, conn)
-		}()
-	}
-	return nil
-}
-
-func (c *Console) newAgent(urls *core.URLs, r *RunnerConfig) (*agent.Agent, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return nil, err
-	}
-
-	username, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-
-	return agent.NewAgent(&agent.Config{
-		Type: core.CLIENT,
-		Mod:  r.Mod,
-		URLs: &core.URLs{
-			ConsoleURL: urls.ConsoleURL.Copy(),
-		},
-		ExternalIP: c.Config.IP,
-		Alias:      c.Config.Alias,
-		AuthKey:    []byte(r.Key),
-		Proxies:    r.Proxies,
-		Redirect:   r.Redirect,
-		Interfaces: utils.GetLocalSubnet(),
-		Params: map[string]string{
-			"ip":   r.IP,
-			"name": (hostname + "-" + utils.GenerateMachineHash())[:24],
-		},
-		Username: username.Username,
-		Hostname: hostname,
-	})
 }
 
 func (c *Console) Dial(address *core.URL) (*agent.Agent, error) {
@@ -255,16 +161,112 @@ func (c *Console) Dial(address *core.URL) (*agent.Agent, error) {
 	}
 	a, err := c.newAgent(c.URLs, c.Config)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
-
+	// Pass transport addr for dynamic reconfiguration (e.g. *SimplexAddr)
+	if addr := c.tunnel.Meta("simplex_addr"); addr != nil {
+		if na, ok := addr.(net.Addr); ok {
+			a.TransportAddr = na
+		}
+	}
 	err = a.Login(conn)
 	if err != nil {
+		conn.Close() // close transport first — stops polling goroutines
 		a.Close(err)
 		return nil, err
 	}
 	err = a.Dial(c.RemoteURL, c.LocalURL)
 	if err != nil {
+		conn.Close()
+		a.Close(err)
+		return nil, err
+	}
+	agent.Agents.Add(a)
+
+	// Initialize yamux session and start background loops before forking.
+	// Both are idempotent (HandlerInit checks Init flag, StartBackgroundLoops uses sync.Once).
+	if len(c.Config.ExtraServes) > 0 {
+		if err := a.HandlerInit(); err != nil {
+			a.Close(err)
+			return nil, err
+		}
+		a.StartBackgroundLoops()
+	}
+
+	// Auto-fork extra serves
+	for _, extra := range c.Config.ExtraServes {
+		alias := utils.RandomString(8)
+		ctrl := &message.Control{
+			Mod:         c.Config.Mod,
+			Source:      alias,
+			Destination: a.ID, // match primary agent so server processes locally
+			Local:       extra.RemoteURL.String(),
+			Remote:      extra.LocalURL.String(),
+		}
+		forked, err := a.Fork(ctrl)
+		if err != nil {
+			utils.Log.Errorf("[fork] extra serve failed: %s", err.Error())
+			continue
+		}
+		a.Send(&message.Control{
+			Mod:         ctrl.Mod,
+			Source:      ctrl.Source,
+			Destination: ctrl.Destination,
+			Local:       ctrl.Local,
+			Remote:      ctrl.Remote,
+			Fork:        true,
+		})
+		agent.Agents.Add(forked)
+	}
+
+	return a, nil
+}
+
+// DialDirectionalPair dials up/down channels, then merges them into one logical Conn.
+func (c *Console) DialDirectionalPair(upURL, downURL *core.URL) (*agent.Agent, error) {
+	a, err := c.newAgent(c.URLs, c.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dial up channel (uses Console's own tunnel, which matches upURL's protocol)
+	upConn, err := c.tunnel.Dial(upURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("dial up: %w", err)
+	}
+	if err := loginWithChannelRole(upConn, a, c.token, core.DirUp, upURL); err != nil {
+		upConn.Close()
+		return nil, fmt.Errorf("login up: %w", err)
+	}
+	utils.Log.Infof("[connhub] up channel ready")
+
+	// Create a second tunnel for the down channel
+	downTun, err := tunnel.NewTunnel(context.Background(), downURL.Tunnel, false)
+	if err != nil {
+		upConn.Close()
+		return nil, fmt.Errorf("new down tunnel: %w", err)
+	}
+	downConn, err := downTun.Dial(downURL.String())
+	if err != nil {
+		upConn.Close()
+		return nil, fmt.Errorf("dial down: %w", err)
+	}
+	if err := loginWithChannelRole(downConn, a, c.token, core.DirDown, downURL); err != nil {
+		upConn.Close()
+		downConn.Close()
+		return nil, fmt.Errorf("login down: %w", err)
+	}
+	utils.Log.Infof("[connhub] down channel ready")
+
+	// Merge: client writes to upConn, reads from downConn
+	dc := mergeHalfConn(downConn, upConn)
+	a.Conn = dc
+
+	// Send ControlMsg over the merged conn
+	err = a.Dial(c.RemoteURL, c.LocalURL)
+	if err != nil {
+		dc.Close()
 		return nil, err
 	}
 	agent.Agents.Add(a)
@@ -343,8 +345,12 @@ func (c *Console) Accept() (*agent.Agent, error) {
 		return nil, err
 	}
 
+	// 设置 login 读取超时，防止残留连接阻塞 accept 循环
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	loginMsg, err := cio.ReadAndAssertMsg(conn, message.LoginMsg)
+	conn.SetReadDeadline(time.Time{}) // 清除超时
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 
@@ -358,23 +364,41 @@ func (c *Console) Accept() (*agent.Agent, error) {
 		cio.WriteMsg(conn, &message.Ack{Status: message.StatusSuccess})
 	}
 
-	controlMsg, err := cio.ReadAndAssertMsg(conn, message.ControlMsg)
-	if err != nil {
-		return nil, err
-	} else {
-		cio.WriteMsg(conn, &message.Ack{Status: message.StatusSuccess})
+	if login.ChannelRole != "" {
+		return c.handleConnHubAccept(conn, login)
 	}
+
+	return c.finishAccept(conn, login)
+}
+
+// finishAccept completes the normal (non-duplex) accept flow: read Control, create Agent.
+func (c *Console) finishAccept(conn net.Conn, login *message.Login) (*agent.Agent, error) {
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	controlMsg, err := cio.ReadAndAssertMsg(conn, message.ControlMsg)
+	conn.SetReadDeadline(time.Time{}) // 清除超时
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	cio.WriteMsg(conn, &message.Ack{Status: message.StatusSuccess})
 	control := controlMsg.(*message.Control)
+	if old, ok := agent.Agents.Get(login.Agent); ok {
+		utils.Log.Warnf("[connhub] id=%s replacing existing session by new login/control", login.Agent)
+		old.Close(fmt.Errorf("replaced by new login/control"))
+		agent.Agents.Delete(old.ID)
+	}
+
 	server, err := agent.NewAgent(&agent.Config{
-		Alias:      login.Agent,
-		Type:       core.SERVER,
-		Mod:        control.Mod,
-		Redirect:   control.Destination,
-		ExternalIP: c.Config.IP,
-		Interfaces: login.Interfaces,
-		Hostname:   login.Hostname,
-		Username:   login.Username,
-		Controller: control,
+		Alias:       login.Agent,
+		Type:        core.SERVER,
+		Mod:         control.Mod,
+		Redirect:    control.Destination,
+		ExternalIP:  c.Config.IP,
+		Interfaces:  login.Interfaces,
+		Hostname:    login.Hostname,
+		Username:    login.Username,
+		Controller:  control,
+		LoadBalance: control.Options["lb"],
 		URLs: &core.URLs{
 			ConsoleURL: login.ConsoleURL(),
 			RemoteURL:  control.LocalURL(),
@@ -382,109 +406,150 @@ func (c *Console) Accept() (*agent.Agent, error) {
 		},
 		Params: control.Options,
 	})
+	if err != nil {
+		return nil, err
+	}
+	server.Recover = func() error { return c.Run() }
 	server.Conn = conn
-	utils.Log.Importantf("%s:%s %s connected from %s, iface: %v", server.Hostname, server.Username, server.Name(), conn.RemoteAddr().String(), server.Interfaces)
+	// Pass transport addr for dynamic reconfiguration (e.g. *SimplexAddr)
+	if addr := c.tunnel.Meta("simplex_addr"); addr != nil {
+		if na, ok := addr.(net.Addr); ok {
+			server.TransportAddr = na
+		}
+	}
+	if err := server.HandlerInit(); err != nil {
+		server.Close(err)
+		return nil, err
+	}
+	utils.Log.Importantf("%s:%s %s connected from %s, iface: %v",
+		server.Hostname, server.Username, server.Name(), conn.RemoteAddr().String(), server.Interfaces)
 	agent.Agents.Add(server)
 	return server, nil
 }
 
-func (c *Console) Handler(server *agent.Agent) {
-	defer func() {
-		agent.Agents.Delete(server.ID)
-	}()
-	err := server.Handler()
-	if err != nil {
-		server.Log("handler", logs.DebugLevel, "%s", err.Error())
+func (c *Console) attachConnToAgent(agentID, label string, conn net.Conn) error {
+	if label == "" {
+		return fmt.Errorf("attach requires non-empty role id")
 	}
+	a, ok := agent.Agents.Get(agentID)
+	if !ok {
+		return fmt.Errorf("agent %s not found for channel attach", agentID)
+	}
+	if a.Closed {
+		return fmt.Errorf("agent %s closed for channel attach", agentID)
+	}
+	return a.AttachConn(conn, label)
 }
 
-func (c *Console) handlerSubscribe() {
-	var subURL *core.URL
-	if c.sub != nil {
-		subURL = c.sub
-	} else {
-		subURL, _ = core.NewURL(fmt.Sprintf("http://0.0.0.0:%d", utils.RandPort()))
-	}
-	if subURL.Path == "" {
-		subURL.Path = "/" + utils.GenerateMachineHash()
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc(subURL.Path, func(w http.ResponseWriter, request *http.Request) {
-		var proxies []*utils.Proxies
-		agent.Agents.Range(func(key, value interface{}) bool {
-			a := value.(*agent.Agent)
-			if a.Inbound != nil {
-				if proxy := a.Inbound.ToClash(); proxy != nil {
-					proxies = append(proxies, proxy)
-				}
-			}
+// handleConnHubAccept resolves role-based conn (full/up/down) and either:
+//   - waits for pair (return nil,nil),
+//   - attaches to an existing agent channel set,
+//   - or treats it as initial conn and proceeds to finishAccept.
+func pendingConnKey(agentID, channelID string) string {
+	return agentID + "|" + channelID
+}
 
-			return true
-		})
-
-		var proxyNames []string
-		for _, proxy := range proxies {
-			proxyNames = append(proxyNames, proxy.Name)
+func (c *Console) matchPendingConn(agentID string, role channelRole, current pendingConn) (readyConn net.Conn, readyLogin *message.Login, ready bool, err error) {
+	if role.Mode != core.DirUp && role.Mode != core.DirDown {
+		if role.ID == "" {
+			// No role id is a session entry connection.
+			return current.conn, current.login, true, nil
 		}
+		// Non directional role ids are direct attach channels.
+		return current.conn, current.login, true, nil
+	}
 
-		data, err := yaml.Marshal(&utils.ClashConfig{
-			Proxies: proxies,
-			Mode:    "rule",
-			ProxyGroups: []*utils.ProxyGroup{
-				{
-					Name:    "10_NET",
-					Type:    "select",
-					Proxies: append(proxyNames, "DIRECT"),
-				},
-				{
-					Name:    "172_NET",
-					Type:    "select",
-					Proxies: append(proxyNames, "DIRECT"),
-				},
-				{
-					Name:    "192_NET",
-					Type:    "select",
-					Proxies: append(proxyNames, "DIRECT"),
-				},
-			},
-			Rules: []string{
-				// 10段内网
-				"IP-CIDR,10.0.0.0/8,10_NET",
-				// 172段内网
-				"IP-CIDR,172.16.0.0/12,172_NET",
-				// 192段内网
-				"IP-CIDR,192.168.0.0/16,192_NET",
-				// 其他流量直连
-				"MATCH,DIRECT",
-			},
-		})
+	key := pendingConnKey(agentID, role.ID)
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
 
-		if err != nil {
-			utils.Log.Error(err)
-			return
+	pair := c.pending[key]
+	if pair == nil {
+		pair = &pendingPair{createdAt: time.Now()}
+		c.pending[key] = pair
+	}
+
+	switch role.Mode {
+	case core.DirUp:
+		if pair.up.conn != nil {
+			return nil, nil, false, fmt.Errorf("duplicate up role for %s", key)
 		}
-		w.Header().Set("Content-Disposition", "attachment;filename*=UTF-8''clash_proxies")
-		w.WriteHeader(200)
-		w.Write(data)
+		pair.up = current
+	case core.DirDown:
+		if pair.down.conn != nil {
+			return nil, nil, false, fmt.Errorf("duplicate down role for %s", key)
+		}
+		pair.down = current
+	}
+
+	if pair.up.conn == nil || pair.down.conn == nil {
+		return nil, nil, false, nil
+	}
+
+	delete(c.pending, key)
+	// Server direction: read from up, write to down.
+	return mergeHalfConn(pair.up.conn, pair.down.conn), pair.up.login, true, nil
+}
+
+func (c *Console) handleConnHubAccept(conn net.Conn, login *message.Login) (*agent.Agent, error) {
+	role, err := parseChannelRole(login.ChannelRole)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	resolvedConn, resolvedLogin, ready, err := c.matchPendingConn(login.Agent, role, pendingConn{
+		conn:  conn,
+		login: login,
 	})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if !ready {
+		utils.Log.Infof("[connhub] id=%s role=%s waiting pair", login.Agent, login.ChannelRole)
+		return nil, nil
+	}
 
-	go func() {
-		server := &http.Server{
-			Addr:    fmt.Sprintf("0.0.0.0:%s", subURL.Port()),
-			Handler: mux,
+	// Attach is only allowed for connections with an explicit role.ID.
+	// No role.ID is always treated as a new session entry channel.
+	if role.ID != "" {
+		if err := c.attachConnToAgent(resolvedLogin.Agent, role.ID, resolvedConn); err != nil {
+			_ = resolvedConn.Close()
+			return nil, err
 		}
-		err := server.ListenAndServe()
-		if err != nil {
-			utils.Log.Error(err)
-		}
-	}()
+		utils.Log.Infof("[connhub] id=%s channel %s attached", resolvedLogin.Agent, role.ID)
+		return nil, nil
+	}
 
-	utils.Log.Importantf("subscribe server started at http://%s:%s%s", c.Config.IP, subURL.Port(), subURL.Path)
-	return
+	utils.Log.Infof("[connhub] id=%s channel ready", resolvedLogin.Agent)
+	return c.finishAccept(resolvedConn, resolvedLogin)
+}
+
+func (c *Console) Handler(server *agent.Agent) {
+	err := server.Handler()
+	if err != nil {
+		server.Log("handler", logs.ImportantLevel, "Handler error: %s", err.Error())
+	}
+	server.Close(err)
+	// Delete agent immediately after Handler returns, before defer cleanup
+	agent.Agents.Delete(server.ID)
 }
 
 func (c *Console) Close() error {
 	c.closed = true
+	c.stopPendingReaper()
+	c.pendingMu.Lock()
+	for _, pair := range c.pending {
+		if pair.up.conn != nil {
+			_ = pair.up.conn.Close()
+		}
+		if pair.down.conn != nil {
+			_ = pair.down.conn.Close()
+		}
+	}
+	c.pending = map[string]*pendingPair{}
+	c.pendingMu.Unlock()
 	agent.Agents.Range(func(key, value interface{}) bool {
 		value.(*agent.Agent).Close(nil)
 		return true
@@ -494,7 +559,7 @@ func (c *Console) Close() error {
 
 func (c *Console) Link() string {
 	u := c.tunnel.Addr().(*core.URL)
-	if u.Scheme != core.UNIXTunnel {
+	if u.Hostname() == "0.0.0.0" {
 		u.SetHostname(c.Config.IP)
 	}
 	return u.String()
@@ -502,4 +567,66 @@ func (c *Console) Link() string {
 
 func (c *Console) Subscribe() string {
 	return c.sub.String()
+}
+
+func (c *Console) startPendingReaper() {
+	c.pendingReaperOnce.Do(func() {
+		c.pendingStop = make(chan struct{})
+		c.pendingDone = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(pendingReapInterval)
+			defer ticker.Stop()
+			defer close(c.pendingDone)
+			for {
+				select {
+				case <-ticker.C:
+					c.reapExpiredPending(time.Now())
+				case <-c.pendingStop:
+					return
+				}
+			}
+		}()
+	})
+}
+
+func (c *Console) stopPendingReaper() {
+	c.pendingStopOnce.Do(func() {
+		if c.pendingStop != nil {
+			close(c.pendingStop)
+		}
+		if c.pendingDone != nil {
+			<-c.pendingDone
+		}
+	})
+}
+
+func closePendingConn(conn net.Conn) {
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (c *Console) cleanupExpiredPendingLocked(now time.Time) {
+	for key, pair := range c.pending {
+		if pair == nil {
+			delete(c.pending, key)
+			continue
+		}
+		if pair.createdAt.IsZero() {
+			pair.createdAt = now
+		}
+		if now.Sub(pair.createdAt) < pendingPairTTL {
+			continue
+		}
+		closePendingConn(pair.up.conn)
+		closePendingConn(pair.down.conn)
+		delete(c.pending, key)
+		utils.Log.Warnf("[connhub] pending pair timeout, dropped: %s", key)
+	}
+}
+
+func (c *Console) reapExpiredPending(now time.Time) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	c.cleanupExpiredPendingLocked(now)
 }

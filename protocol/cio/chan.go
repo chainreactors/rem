@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/chainreactors/go-metrics"
+	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/pkg/errors"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -21,26 +22,46 @@ const (
 
 type Message struct {
 	ID      uint64
-	Message proto.Message
+	Message message.Message
+}
+
+// simpleCounter is a lock-free counter based on atomic int64.
+type simpleCounter struct{ val int64 }
+
+func (c *simpleCounter) Inc(n int64)  { atomic.AddInt64(&c.val, n) }
+func (c *simpleCounter) Dec(n int64)  { atomic.AddInt64(&c.val, -n) }
+func (c *simpleCounter) Count() int64 { return atomic.LoadInt64(&c.val) }
+func (c *simpleCounter) Clear()       { atomic.StoreInt64(&c.val, 0) }
+
+// simpleMeter tracks total bytes and computes a simple rate.
+type simpleMeter struct {
+	total int64
+	start time.Time
+}
+
+func newSimpleMeter() *simpleMeter  { return &simpleMeter{start: time.Now()} }
+func (m *simpleMeter) Mark(n int64) { atomic.AddInt64(&m.total, n) }
+func (m *simpleMeter) Rate1() float64 {
+	elapsed := time.Since(m.start).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(atomic.LoadInt64(&m.total)) / elapsed
 }
 
 // TrafficStats 流量统计
 type TrafficStats struct {
-	bytes        metrics.Counter
-	packets      metrics.Counter
-	rate         metrics.Meter
-	pendingCount metrics.Counter // 待发送的数据包数量
-	pendingSize  metrics.Counter // 待发送的数据大小
-	pendingMap   sync.Map        // 存储每个连接的pending counter
+	bytes        simpleCounter
+	packets      simpleCounter
+	rate         *simpleMeter
+	pendingCount simpleCounter
+	pendingSize  simpleCounter
+	pendingMap   sync.Map // map[uint64]*simpleCounter
 }
 
 func NewTrafficStats(name string) *TrafficStats {
 	return &TrafficStats{
-		bytes:        metrics.NewCounter(),
-		packets:      metrics.NewCounter(),
-		rate:         metrics.NewMeter(),
-		pendingCount: metrics.NewCounter(),
-		pendingSize:  metrics.NewCounter(),
+		rate: newSimpleMeter(),
 	}
 }
 
@@ -89,8 +110,7 @@ func (ts *TrafficStats) GetPendingCount(id uint64) int64 {
 // ClearPending 清理所有待发送计数
 func (ts *TrafficStats) ClearPending() {
 	ts.pendingMap.Range(func(key, value interface{}) bool {
-		counter := value.(metrics.Counter)
-		counter.Clear()
+		value.(*simpleCounter).Clear()
 		return true
 	})
 	ts.pendingCount.Clear()
@@ -98,14 +118,14 @@ func (ts *TrafficStats) ClearPending() {
 }
 
 // getPendingCounter 获取或创建指定ID的counter
-func (ts *TrafficStats) getPendingCounter(id uint64) metrics.Counter {
+func (ts *TrafficStats) getPendingCounter(id uint64) *simpleCounter {
 	value, ok := ts.pendingMap.Load(id)
 	if !ok {
-		counter := metrics.NewCounter()
-		ts.pendingMap.Store(id, counter)
-		return counter
+		counter := &simpleCounter{}
+		actual, _ := ts.pendingMap.LoadOrStore(id, counter)
+		return actual.(*simpleCounter)
 	}
-	return value.(metrics.Counter)
+	return value.(*simpleCounter)
 }
 
 func NewChan(name string, capacity int) *Channel {
@@ -124,15 +144,16 @@ func NewChan(name string, capacity int) *Channel {
 }
 
 type Channel struct {
-	Mod    int
-	Name   string
-	C      chan *Message
-	StopCh chan struct{}
-	stats  *TrafficStats // 流量统计
+	Mod       int
+	Name      string
+	C         chan *Message
+	StopCh    chan struct{}
+	stats     *TrafficStats // 流量统计
+	closeOnce sync.Once
 }
 
 // Send 发送消息
-func (m *Channel) Send(id uint64, msg proto.Message) error {
+func (m *Channel) Send(id uint64, msg message.Message) error {
 	select {
 	case <-m.StopCh:
 		return errors.New("channel has closed")
@@ -145,7 +166,7 @@ func (m *Channel) Send(id uint64, msg proto.Message) error {
 	}
 
 	if m.Mod == Sender {
-		size := int64(proto.Size(msg))
+		size := int64(message.Size(msg))
 		m.stats.AddPending(id, size)
 	}
 
@@ -172,7 +193,7 @@ func (m *Channel) Receiver(conn net.Conn) error {
 				return err
 			}
 
-			size := int64(proto.Size(msg))
+			size := int64(message.Size(msg))
 			m.stats.packets.Inc(1)
 			m.stats.bytes.Inc(size)
 			m.stats.rate.Mark(size)
@@ -203,7 +224,7 @@ func (m *Channel) Sender(conn net.Conn) error {
 				return err
 			}
 
-			size := int64(proto.Size(msg.Message))
+			size := int64(message.Size(msg.Message))
 			m.stats.packets.Inc(1)
 			m.stats.bytes.Inc(size)
 			m.stats.rate.Mark(size)
@@ -222,13 +243,10 @@ func (m *Channel) GetStats() string {
 }
 
 func (m *Channel) Close() {
-	defer func() {
-		if recover() != nil {
-		}
-	}()
-
-	utils.Log.Debugf("[channel.close] close channel %s", m.Name)
-	close(m.StopCh)
-	close(m.C)
-	m.stats.ClearPending()
+	m.closeOnce.Do(func() {
+		utils.Log.Debugf("[channel.close] close channel %s", m.Name)
+		close(m.StopCh)
+		close(m.C)
+		m.stats.ClearPending()
+	})
 }

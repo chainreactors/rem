@@ -2,7 +2,6 @@ package socks5
 
 import (
 	"bytes"
-	"encoding/binary"
 	"io"
 	"log"
 	"net"
@@ -12,31 +11,34 @@ import (
 )
 
 func TestSOCKS5_Connect(t *testing.T) {
-	// Create a local listener
+	// Create a local listener (target)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	defer l.Close()
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			return
 		}
 		defer conn.Close()
 
 		buf := make([]byte, 4)
 		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 
 		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+			t.Errorf("bad: %v", buf)
+			return
 		}
 		conn.Write([]byte("pong"))
 	}()
 	lAddr := l.Addr().(*net.TCPAddr)
 
-	// Create a socks server
+	// Create a socks server with user/pass auth
 	creds := StaticCredentials{
 		"foo": "bar",
 	}
@@ -50,61 +52,38 @@ func TestSOCKS5_Connect(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Start listening
-	go func() {
-		if err := serv.ListenAndServe("tcp", "127.0.0.1:12365"); err != nil {
-			t.Fatalf("err: %v", err)
-		}
-	}()
-	time.Sleep(10 * time.Millisecond)
-
-	// Get a local conn
-	conn, err := net.Dial("tcp", "127.0.0.1:12365")
+	// Start listening on dynamic port
+	sl, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	defer sl.Close()
+	go serv.Serve(sl)
+	time.Sleep(10 * time.Millisecond)
 
-	// Connect, auth and connec to local
-	req := bytes.NewBuffer(nil)
-	req.Write([]byte{5})
-	req.Write([]byte{2, NoAuth, UserPassAuth})
-	req.Write([]byte{1, 3, 'f', 'o', 'o', 3, 'b', 'a', 'r'})
-	req.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
-
-	port := []byte{0, 0}
-	binary.BigEndian.PutUint16(port, uint16(lAddr.Port))
-	req.Write(port)
-
-	// Send a ping
-	req.Write([]byte("ping"))
-
-	// Send all the bytes
-	conn.Write(req.Bytes())
-
-	// Verify response
-	expected := []byte{
-		socks5Version, UserPassAuth,
-		1, authSuccess,
-		5,
-		0,
-		0,
-		1,
-		127, 0, 0, 1,
-		0, 0,
-		'p', 'o', 'n', 'g',
+	// Connect to SOCKS5 server
+	conn, err := net.Dial("tcp", sl.Addr().String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
 	}
-	out := make([]byte, len(expected))
+	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(time.Second))
-	if _, err := io.ReadAtLeast(conn, out, len(out)); err != nil {
+	// Use ClientConnect for proper step-by-step handshake
+	if err := ClientConnect(conn, lAddr.String(), "foo", "bar"); err != nil {
+		t.Fatalf("ClientConnect: %v", err)
+	}
+
+	// Send ping after handshake completes
+	conn.Write([]byte("ping"))
+
+	// Read pong
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	out := make([]byte, 4)
+	if _, err := io.ReadAtLeast(conn, out, 4); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Ignore the port
-	out[12] = 0
-	out[13] = 0
-
-	if !bytes.Equal(out, expected) {
-		t.Fatalf("bad: %v", out)
+	if !bytes.Equal(out, []byte("pong")) {
+		t.Fatalf("expected pong, got %v", out)
 	}
 }

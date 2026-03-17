@@ -2,11 +2,11 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"github.com/chainreactors/logs"
 	"github.com/chainreactors/rem/runner"
 	"github.com/chainreactors/rem/x/utils"
-	"github.com/jessevdk/go-flags"
 	"github.com/kballard/go-shellquote"
 	"os"
 	"time"
@@ -14,18 +14,17 @@ import (
 
 var ver = ""
 
-func RUN() {
-	defer exit()
-	var option runner.Options
-	parser := flags.NewParser(&option, flags.Default)
-	parser.Usage = `
+const usage = `
 	WIKI: https://chainreactors.github.io/wiki/rem
 
 	QUICKSTART:
-		serving:
+		start server (listen on default address):
+			./rem -s tcp://0.0.0.0:34996
+
+		or just (uses default server address):
 			./rem
 
-		reverse socks5 proxy:
+		reverse socks5 proxy (client connects to server):
 			./rem -c [link]
 
 		serve socks5 proxy on client:
@@ -36,8 +35,12 @@ func RUN() {
 
 		local port forward:
 			./rem -c [link] -r port://:8080
-		
+
 `
+
+func RUN() {
+	defer exit()
+	var option runner.Options
 	var args []string
 	reader := bufio.NewReader(os.Stdin)
 	ch := make(chan string)
@@ -62,9 +65,12 @@ func RUN() {
 		args = os.Args[1:]
 	}
 
-	_, err := parser.ParseArgs(args)
+	err := option.ParseArgs(args)
 	if err != nil {
-		if err.(*flags.Error).Type != flags.ErrHelp {
+		if errors.Is(err, runner.ErrHelpRequested) {
+			fmt.Print(usage)
+			fmt.Print(runner.OptionsUsage())
+		} else {
 			fmt.Println(err.Error())
 		}
 		return
@@ -74,30 +80,10 @@ func RUN() {
 		fmt.Println(ver)
 		return
 	}
-	// 如果命令行参数为空，使用编译时设置的默认值
-	if option.Mod == "" {
-		option.Mod = runner.DefaultMod
-	}
-	if len(option.ConsoleAddr) == 0 {
-		option.ConsoleAddr = []string{runner.DefaultConsole}
-	}
-	if option.LocalAddr == "" {
-		option.LocalAddr = runner.DefaultLocal
-	}
-	if option.RemoteAddr == "" {
-		option.RemoteAddr = runner.DefaultRemote
-	}
 
-	if option.Debug {
-		utils.Log = logs.NewLogger(logs.DebugLevel)
-		utils.Log.LogFileName = "maitai.log"
-		utils.Log.Init()
-	} else if option.Detail {
-		utils.Log = logs.NewLogger(utils.IOLog)
-	} else if option.Quiet {
-		utils.Log = logs.NewLogger(100)
-	} else {
-		utils.Log = logs.NewLogger(logs.InfoLevel)
+	if option.List {
+		runner.ListRegistered()
+		return
 	}
 
 	runner, err := option.Prepare()

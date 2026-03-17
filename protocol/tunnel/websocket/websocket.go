@@ -14,10 +14,10 @@ import (
 func init() {
 	core.ListenerRegister(core.WebSocketTunnel, func(ctx context.Context) (core.TunnelListener, error) {
 		return NewWebsocketListener(ctx), nil
-	})
+	}, "websocket", "wss")
 	core.DialerRegister(core.WebSocketTunnel, func(ctx context.Context) (core.TunnelDialer, error) {
 		return NewWebsocketDialer(ctx), nil
-	})
+	}, "websocket", "wss")
 }
 
 type WebsocketDialer struct {
@@ -52,10 +52,26 @@ func (c *WebsocketDialer) Dial(dst string) (net.Conn, error) {
 		conf.TlsConfig = tlsconf.(*tls.Config)
 	}
 
-	conn, err := websocket.DialConfig(conf)
+	rawConn, err := core.GetContextDialer(c.meta).DialContext(context.Background(), "tcp", u.Host)
 	if err != nil {
 		return nil, err
 	}
+
+	if scheme == "wss" {
+		tlsConn := tls.Client(rawConn, conf.TlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		rawConn = tlsConn
+	}
+
+	conn, err := websocket.NewClient(conf, rawConn)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	conn.PayloadType = websocket.BinaryFrame
 	return conn, nil
 }
 
@@ -90,6 +106,7 @@ func (c *WebsocketListener) Listen(dst string) (net.Listener, error) {
 	c.acceptCh = make(chan *websocket.Conn)
 	muxer := http.NewServeMux()
 	muxer.Handle(u.Path, websocket.Handler(func(conn *websocket.Conn) {
+		conn.PayloadType = websocket.BinaryFrame
 		notifyCh := make(chan struct{})
 		c.acceptCh <- conn
 		<-notifyCh

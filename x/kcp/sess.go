@@ -48,6 +48,7 @@ package kcp
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"github.com/chainreactors/rem/x/simplex"
 	"hash/crc32"
 	"io"
 	"net"
@@ -90,7 +91,7 @@ var (
 )
 
 var (
-	// a system-wide packet buffer shared among sending, receiving and FEC
+	// a system-wide packet buf shared among sending, receiving and FEC
 	// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
 	// is aligned to 64bit
 	xmitBuf sync.Pool
@@ -279,7 +280,7 @@ RESET_TIMER:
 			}
 
 			// otherwise, read to recvbuf first, then copy to 'b'.
-			// dynamically adjust the buffer size to the maximum of 'packet size' when necessary.
+			// dynamically adjust the buf size to the maximum of 'packet size' when necessary.
 			if cap(s.recvbuf) < size {
 				// usually recvbuf has a size of maximum packet size
 				s.recvbuf = make([]byte, size)
@@ -376,7 +377,7 @@ RESET_TIMER:
 		s.mu.Unlock()
 
 		// if it runs here, that means we have to block the call, and wait until the
-		// transmit buffer to become available again.
+		// transmit buf to become available again.
 		select {
 		case <-s.chWriteEvent:
 			if timeout != nil {
@@ -554,7 +555,7 @@ func (s *KCPSession) SetDSCP(dscp int) error {
 	return errInvalidOperation
 }
 
-// SetReadBuffer sets the socket read buffer, no effect if it's accepted from Listener
+// SetReadBuffer sets the socket read buf, no effect if it's accepted from Listener
 func (s *KCPSession) SetReadBuffer(bytes int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -566,7 +567,7 @@ func (s *KCPSession) SetReadBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
-// SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
+// SetWriteBuffer sets the socket write buf, no effect if it's accepted from Listener
 func (s *KCPSession) SetWriteBuffer(bytes int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -819,7 +820,7 @@ func (s *KCPSession) kcpInput(data []byte) {
 				} else {
 					fecErrs++
 				}
-				// recycle the buffer
+				// recycle the buf
 				xmitBuf.Put(r)
 			}
 
@@ -969,7 +970,7 @@ func (l *Listener) notifyReadError(err error) {
 	})
 }
 
-// SetReadBuffer sets the socket read buffer for the Listener
+// SetReadBuffer sets the socket read buf for the Listener
 func (l *Listener) SetReadBuffer(bytes int) error {
 	if nc, ok := l.conn.(setReadBuffer); ok {
 		return nc.SetReadBuffer(bytes)
@@ -977,7 +978,7 @@ func (l *Listener) SetReadBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
-// SetWriteBuffer sets the socket write buffer for the Listener
+// SetWriteBuffer sets the socket write buf for the Listener
 func (l *Listener) SetWriteBuffer(bytes int) error {
 	if nc, ok := l.conn.(setWriteBuffer); ok {
 		return nc.SetWriteBuffer(bytes)
@@ -1124,7 +1125,12 @@ func ListenWithOptions(network, address string, block BlockCrypt, dataShards, pa
 		conn = &icmpConn{PacketConn: rawConn, port: portNum, isClient: false}
 
 	default:
-		conn, err = NewSimplexServer(network, address)
+		sim, err := simplex.NewSimplexServer(network, address)
+		if err != nil {
+			return nil, err
+		}
+		sim.SetIsControlPacket(isKCPControlPacket)
+		conn = sim
 	}
 
 	if err != nil {
@@ -1174,7 +1180,12 @@ func DialWithOptions(network, address string, block BlockCrypt, dataShards, pari
 		}
 		conn = &icmpConn{PacketConn: rawConn, port: localPort, isClient: true}
 	default:
-		conn, err = NewSimplexClient(raddr.(*SimplexAddr))
+		sim, err := simplex.NewSimplexClient(raddr.(*simplex.SimplexAddr))
+		if err != nil {
+			return nil, err
+		}
+		sim.SetIsControlPacket(isKCPControlPacket)
+		conn = sim
 	}
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1252,4 +1263,13 @@ func NewConn(raddr string, block BlockCrypt, dataShards, parityShards int, conn 
 
 func SetKCPMTULimit(mtu int) {
 	mtuLimit = mtu
+}
+
+// 判断是否是KCP控制包
+func isKCPControlPacket(data []byte) bool {
+	if len(data) < 24 { // KCP头部最小长度
+		return false
+	}
+	cmd := data[4]   // cmd在KCP头部的第5个字节
+	return cmd != 81 // 	IKCP_CMD_PUSH    = 81  cmd: push data不是数据包就是控制包
 }

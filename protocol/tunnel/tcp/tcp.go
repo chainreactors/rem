@@ -2,8 +2,9 @@ package tcp
 
 import (
 	"context"
-	"github.com/chainreactors/rem/protocol/core"
 	"net"
+
+	"github.com/chainreactors/rem/protocol/core"
 )
 
 func init() {
@@ -33,7 +34,7 @@ func (c *TCPDialer) Dial(dst string) (net.Conn, error) {
 		return nil, err
 	}
 	c.meta["url"] = u
-	return net.Dial("tcp", u.Host)
+	return core.GetContextDialer(c.meta).DialContext(context.Background(), "tcp", u.Host)
 }
 
 type TCPListener struct {

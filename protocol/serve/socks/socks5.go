@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 
@@ -44,7 +43,7 @@ func NewSocks5Server(username, password string, dial core.ContextDialer) (*socks
 
 	conf := &socks5.Config{
 		AuthMethods: auth,
-		Logger:      log.New(ioutil.Discard, "", log.LstdFlags),
+		Logger:      log.New(io.Discard, "", log.LstdFlags),
 	}
 	if dial != nil {
 		conf.Dial = dial.DialContext
@@ -55,7 +54,8 @@ func NewSocks5Server(username, password string, dial core.ContextDialer) (*socks
 func NewRelaySocksServer() (*socks5.Server, error) {
 	conf := &socks5.Config{
 		AuthMethods: []socks5.Authenticator{socks5.RelayAuthenticator{}},
-		Logger:      log.New(ioutil.Discard, "", log.LstdFlags),
+		Resolver:    socks5.PassthroughResolver{},
+		Logger:      log.New(io.Discard, "", log.LstdFlags),
 	}
 	utils.Log.Importantf("[agent.outbound] relay serving")
 	return socks5.New(conf)
@@ -71,6 +71,9 @@ func NewSocksInbound(params map[string]string) (core.Inbound, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Inbound relays requests to the peer's outbound for resolution,
+	// so skip local DNS resolution (also required for TinyGo compatibility).
+	server.Config.Resolver = socks5.PassthroughResolver{}
 	base := core.NewPluginOption(params, core.InboundPlugin, core.Socks5Serve)
 	utils.Log.Importantf("[agent.inbound] Socks5 serving: %s , %s", base.String(), base.URL())
 	return &Socks5Plugin{Server: server, PluginOption: base}, nil
@@ -117,18 +120,18 @@ func (sp *Socks5Plugin) Handle(conn io.ReadWriteCloser, realConn net.Conn) (net.
 		if err != nil {
 			return nil, err
 		}
-		local := target.LocalAddr().(*net.TCPAddr)
-		bind := socks5.AddrSpec{IP: local.IP, Port: local.Port}
 
-		if err := sp.Server.SendReply(conn, socks5.SuccessReply, &bind); err != nil {
+		// TinyGo: LocalAddr() may return nil interface or nil *net.TCPAddr
+		var bindAddr *socks5.AddrSpec
+		if local, ok := target.LocalAddr().(*net.TCPAddr); ok && local != nil {
+			bindAddr = &socks5.AddrSpec{IP: local.IP, Port: local.Port}
+		}
+
+		if err := sp.Server.SendReply(conn, socks5.SuccessReply, bindAddr); err != nil {
 			return nil, fmt.Errorf("Failed to send reply: %v", err)
 		}
 
 		return target, nil
-	//case BindCommand:
-	//	return s.handleBind(ctx, conn, req)
-	//case AssociateCommand:
-	//	return s.handleAssociate(ctx, conn, req)
 	default:
 		if err := sp.Server.SendReply(conn, socks5.CommandNotSupported, nil); err != nil {
 			return nil, fmt.Errorf("Failed to send reply: %v", err)
@@ -147,7 +150,10 @@ func (sp *Socks5Plugin) Relay(conn net.Conn, bridge io.ReadWriteCloser) (net.Con
 		return nil, err
 	}
 
-	rep, addr, _ := socks5.ReadReply(bridge)
+	rep, addr, err := socks5.ReadReply(bridge)
+	if err != nil {
+		return nil, err
+	}
 	replyData, err := socks5.BuildReply(rep, addr)
 	if err != nil {
 		return nil, err

@@ -2,9 +2,10 @@ package core
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 )
 
 type TunnelDialer interface {
@@ -20,7 +21,7 @@ func (w *WrappedDialer) Dial(dst string) (net.Conn, error) {
 	if w.Dialer != nil {
 		return w.Dialer(dst)
 	}
-	return w.Dial(dst)
+	return w.TunnelDialer.Dial(dst)
 }
 
 type TunnelListener interface {
@@ -37,7 +38,7 @@ func (w *WrappedListener) Accept() (net.Conn, error) {
 	if w.Lns != nil {
 		return w.Lns.Accept()
 	}
-	return w.Accept()
+	return w.TunnelListener.Accept()
 }
 
 // DialerCreatorFn 是创建 dialer 的工厂函数
@@ -47,40 +48,122 @@ type DialerCreatorFn func(ctx context.Context) (TunnelDialer, error)
 type ListenerCreatorFn func(ctx context.Context) (TunnelListener, error)
 
 var (
-	dialerCreators   = make(map[string]DialerCreatorFn)
-	listenerCreators = make(map[string]ListenerCreatorFn)
+	dialerCreators   sync.Map // map[string]DialerCreatorFn
+	listenerCreators sync.Map // map[string]ListenerCreatorFn
+	// 别名映射表: alias -> "tunnel+serve" 格式
+	dialerAliases   sync.Map // map[string]string
+	listenerAliases sync.Map // map[string]string
 )
 
-// DialerRegister 注册一个 dialer 类型
-func DialerRegister(name string, fn DialerCreatorFn) {
-	if _, exist := dialerCreators[name]; exist {
-		panic(fmt.Sprintf("dialer [%s] is already registered", name))
+// DialerRegister 注册一个 dialer 类型，可选地注册别名
+// 例如: DialerRegister("tcp+tls", fn, "tls")
+func DialerRegister(name string, fn DialerCreatorFn, aliases ...string) {
+	if _, loaded := dialerCreators.LoadOrStore(name, fn); loaded {
+		// Already registered — overwrite silently for ForceRegister compatibility
+		dialerCreators.Store(name, fn)
 	}
-	dialerCreators[name] = fn
+	// 注册所有别名
+	for _, alias := range aliases {
+		dialerAliases.Store(alias, name)
+	}
 }
 
-// ListenerRegister 注册一个 listener 类型
-func ListenerRegister(name string, fn ListenerCreatorFn) {
-	if _, exist := listenerCreators[name]; exist {
-		panic(fmt.Sprintf("listener [%s] is already registered", name))
+// ListenerRegister 注册一个 listener 类型，可选地注册别名
+// 例如: ListenerRegister("tcp+tls", fn, "tls")
+func ListenerRegister(name string, fn ListenerCreatorFn, aliases ...string) {
+	if _, loaded := listenerCreators.LoadOrStore(name, fn); loaded {
+		listenerCreators.Store(name, fn)
 	}
-	listenerCreators[name] = fn
+	// 注册所有别名
+	for _, alias := range aliases {
+		listenerAliases.Store(alias, name)
+	}
 }
 
 // DialerCreate 创建一个指定类型的 dialer
+// 支持别名解析，如果 name 是别名，会自动解析为实际名称
 func DialerCreate(name string, ctx context.Context) (TunnelDialer, error) {
-	if fn, ok := dialerCreators[name]; ok {
-		return fn(ctx)
+	// 先检查是否是别名
+	if target, ok := dialerAliases.Load(name); ok {
+		name = target.(string)
 	}
-	return nil, fmt.Errorf("dialer [%s] is not registered", name)
+
+	if fn, ok := dialerCreators.Load(name); ok {
+		return fn.(DialerCreatorFn)(ctx)
+	}
+	available := GetRegisteredDialers()
+	return nil, fmt.Errorf("dialer [%s] is not registered. Available dialers: %v", name, available)
 }
 
 // ListenerCreate 创建一个指定类型的 listener
+// 支持别名解析，如果 name 是别名，会自动解析为实际名称
 func ListenerCreate(name string, ctx context.Context) (TunnelListener, error) {
-	if fn, ok := listenerCreators[name]; ok {
-		return fn(ctx)
+	// 先检查是否是别名
+	if target, ok := listenerAliases.Load(name); ok {
+		name = target.(string)
 	}
-	return nil, fmt.Errorf("listener [%s] is not registered", name)
+
+	if fn, ok := listenerCreators.Load(name); ok {
+		return fn.(ListenerCreatorFn)(ctx)
+	}
+	available := GetRegisteredListeners()
+	return nil, fmt.Errorf("listener [%s] is not registered. Available listeners: %v", name, available)
+}
+
+// GetRegisteredDialers 获取所有已注册的 dialer 名称，包括别名
+// 格式: "dns [dot, doh]" 或 "tcp"
+func GetRegisteredDialers() []string {
+	var names []string
+
+	// 构建反向映射: target -> []aliases
+	reverseMap := make(map[string][]string)
+	dialerAliases.Range(func(key, value interface{}) bool {
+		alias := key.(string)
+		target := value.(string)
+		reverseMap[target] = append(reverseMap[target], alias)
+		return true
+	})
+
+	// 添加实际注册的 dialers，如果有别名则附加
+	dialerCreators.Range(func(key, value interface{}) bool {
+		name := key.(string)
+		if aliases, ok := reverseMap[name]; ok {
+			names = append(names, fmt.Sprintf("%s [%s]", name, strings.Join(aliases, ", ")))
+		} else {
+			names = append(names, name)
+		}
+		return true
+	})
+
+	return names
+}
+
+// GetRegisteredListeners 获取所有已注册的 listener 名称，包括别名
+// 格式: "dns [dot, doh]" 或 "tcp"
+func GetRegisteredListeners() []string {
+	var names []string
+
+	// 构建反向映射: target -> []aliases
+	reverseMap := make(map[string][]string)
+	listenerAliases.Range(func(key, value interface{}) bool {
+		alias := key.(string)
+		target := value.(string)
+		reverseMap[target] = append(reverseMap[target], alias)
+		return true
+	})
+
+	// 添加实际注册的 listeners，如果有别名则附加
+	listenerCreators.Range(func(key, value interface{}) bool {
+		name := key.(string)
+		if aliases, ok := reverseMap[name]; ok {
+			names = append(names, fmt.Sprintf("%s [%s]", name, strings.Join(aliases, ", ")))
+		} else {
+			names = append(names, name)
+		}
+		return true
+	})
+
+	return names
 }
 
 func GetMetas(ctx context.Context) Metas {
@@ -109,13 +192,6 @@ func (m Metas) GetString(key string) string {
 }
 func (m Metas) URL() *URL {
 	return m["url"].(*URL)
-}
-
-func (m Metas) TLSConfig() *tls.Config {
-	if v, ok := m["tls"]; ok {
-		return v.(*tls.Config)
-	}
-	return nil
 }
 
 type BeforeHook struct {

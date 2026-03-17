@@ -13,6 +13,7 @@ import (
 	"github.com/chainreactors/rem/x/trojanx"
 	"github.com/chainreactors/rem/x/trojanx/protocol"
 	"github.com/chainreactors/rem/x/utils"
+	"github.com/chainreactors/rem/x/xtls"
 )
 
 func init() {
@@ -25,13 +26,13 @@ func NewTrojanOutbound(options map[string]string, dial core.ContextDialer) (core
 	config := &trojanx.TrojanConfig{
 		Password: pwd,
 	}
+	logger := log.New()
+	logger.SetLevel(log.WarnLevel)
+	logger.SetReportCaller(true)
+	logger.SetOutput(os.Stdout)
 	server := trojanx.NewServer(
 		trojanx.WithConfig(config),
-		trojanx.WithLogger(&log.Logger{
-			Level:        log.WarnLevel,
-			ReportCaller: true,
-			Out:          os.Stdout,
-		}),
+		trojanx.WithLogger(logger),
 		trojanx.WithDial(dial.DialContext),
 	)
 	base := core.NewPluginOption(options, core.OutboundPlugin, core.TrojanServe)
@@ -44,13 +45,13 @@ func NewTrojanInbound(options map[string]string) (core.Inbound, error) {
 	config := &trojanx.TrojanConfig{
 		Password: pwd,
 	}
+	logger := log.New()
+	logger.SetLevel(log.WarnLevel)
+	logger.SetReportCaller(true)
+	logger.SetOutput(os.Stdout)
 	server := trojanx.NewServer(
 		trojanx.WithConfig(config),
-		trojanx.WithLogger(&log.Logger{
-			Level:        log.WarnLevel,
-			ReportCaller: true,
-			Out:          os.Stdout,
-		}),
+		trojanx.WithLogger(logger),
 	)
 	base := core.NewPluginOption(options, core.InboundPlugin, core.TrojanServe)
 	utils.Log.Importantf("[agent.inbound] trojan serving: %s , %s", base.String(), base.URL())
@@ -63,10 +64,8 @@ type TrojanPlugin struct {
 }
 
 func (plug *TrojanPlugin) genSelfSign() []tls.Certificate {
-	signed, _ := generateSelfSigned()
-	var tlsCertificates []tls.Certificate
-	tlsCertificates = append(tlsCertificates, signed)
-	return tlsCertificates
+	cert := xtls.NewRandomTLSKeyPair()
+	return []tls.Certificate{*cert}
 }
 
 func (plug *TrojanPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn) (net.Conn, error) {
@@ -80,11 +79,9 @@ func (plug *TrojanPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn) (ne
 }
 
 func (plug *TrojanPlugin) Relay(conn net.Conn, bridge io.ReadWriteCloser) (net.Conn, error) {
-	signed, _ := generateSelfSigned()
-	var tlsCertificates []tls.Certificate
-	tlsCertificates = append(tlsCertificates, signed)
+	cert := xtls.NewRandomTLSKeyPair()
 	tlsConn := tls.Server(conn, &tls.Config{
-		Certificates: tlsCertificates,
+		Certificates: []tls.Certificate{*cert},
 	})
 	req, err := plug.Server.ParseRequest(tlsConn)
 	if err != nil {

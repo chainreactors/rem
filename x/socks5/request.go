@@ -81,7 +81,6 @@ type Request struct {
 	DestAddr *AddrSpec
 	// AddrSpec of the actual destination (might be affected by rewrite)
 	realDestAddr *AddrSpec
-	bufConn      io.Reader
 }
 
 func (req *Request) BuildRequest() []byte {
@@ -207,7 +206,6 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 		Version:  socks5Version,
 		Command:  header[1],
 		DestAddr: dest,
-		bufConn:  bufConn,
 	}
 
 	return request, nil
@@ -253,10 +251,12 @@ func (s *Server) HandleConnect(conn, target net.Conn) error {
 	defer target.Close()
 
 	// Send success
-	local := target.LocalAddr().(*net.TCPAddr)
-	bind := AddrSpec{IP: local.IP, Port: local.Port}
+	var bindAddr *AddrSpec
+	if local, ok := target.LocalAddr().(*net.TCPAddr); ok && local != nil {
+		bindAddr = &AddrSpec{IP: local.IP, Port: local.Port}
+	}
 
-	if err := s.SendReply(conn, SuccessReply, &bind); err != nil {
+	if err := s.SendReply(conn, SuccessReply, bindAddr); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
 
@@ -378,7 +378,6 @@ func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 	}
 	d.Port = (int(port[0]) << 8) | int(port[1])
 
-	return d, nil
 	return d, nil
 }
 

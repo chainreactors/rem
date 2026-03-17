@@ -4,16 +4,22 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"github.com/chainreactors/logs"
 	"io"
 	"log"
 	"net"
 	"os"
+	"sync"
 )
 
 const (
 	socks5Version = uint8(5)
 )
+
+var requestReaderPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewReaderSize(nil, 512)
+	},
+}
 
 // Config is used to setup and configure a Server
 type Config struct {
@@ -120,9 +126,13 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 		go func() {
-			err = s.ServeConn(conn)
-			if err != nil {
-				logs.Log.Debug("[-] " + err.Error())
+			defer func() {
+				if r := recover(); r != nil {
+					s.Config.Logger.Printf("[ERR] socks5: panic in ServeConn: %v", r)
+				}
+			}()
+			if err := s.ServeConn(conn); err != nil {
+				s.Config.Logger.Printf("[ERR] socks5: %v", err)
 			}
 		}()
 	}
@@ -146,10 +156,6 @@ func (s *Server) ServeConn(conn net.Conn) error {
 			return err
 		}
 		return s.HandleConnect(conn, target)
-	//case BindCommand:
-	//	return s.handleBind(ctx, conn, req)
-	//case AssociateCommand:
-	//	return s.handleAssociate(ctx, conn, req)
 	default:
 		if err := s.SendReply(conn, CommandNotSupported, nil); err != nil {
 			return fmt.Errorf("Failed to send reply: %v", err)
@@ -159,19 +165,22 @@ func (s *Server) ServeConn(conn net.Conn) error {
 }
 
 func (s *Server) ParseRequest(conn net.Conn) (*Request, error) {
-	bufConn := bufio.NewReader(conn)
+	bufConn := requestReaderPool.Get().(*bufio.Reader)
+	bufConn.Reset(conn)
+	defer func() {
+		bufConn.Reset(nil)
+		requestReaderPool.Put(bufConn)
+	}()
 
 	// Read the version byte
 	version := []byte{0}
 	if _, err := bufConn.Read(version); err != nil {
-		//s.config.Logger.Printf("[ERR] socks: Failed to get version byte: %v", err)
 		return nil, err
 	}
 
 	// Ensure we are compatible
 	if version[0] != socks5Version {
 		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
-		//s.config.Logger.Printf("[ERR] socks: %v", err)
 		return nil, err
 	}
 
@@ -179,7 +188,6 @@ func (s *Server) ParseRequest(conn net.Conn) (*Request, error) {
 	authContext, err := s.authenticate(conn, bufConn)
 	if err != nil {
 		err = fmt.Errorf("Failed to authenticate: %v", err)
-		//s.config.Logger.Printf("[ERR] socks: %v", err)
 		return nil, err
 	}
 
@@ -188,7 +196,6 @@ func (s *Server) ParseRequest(conn net.Conn) (*Request, error) {
 		if err == unrecognizedAddrType {
 			if err := s.SendReply(conn, AddrTypeNotSupported, nil); err != nil {
 				return nil, err
-				//return fmt.Errorf("Failed to send reply: %v", err)
 			}
 		}
 		return nil, fmt.Errorf("Failed to read destination address: %v", err)

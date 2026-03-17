@@ -23,9 +23,9 @@
 package kcp
 
 import (
-	"sync/atomic"
-
 	"github.com/pkg/errors"
+	"sync/atomic"
+	"time"
 )
 
 // defaultReadLoop is the standard procedure for reading from a connection
@@ -35,6 +35,10 @@ func (s *KCPSession) defaultReadLoop() {
 	for {
 		if n, addr, err := s.conn.ReadFrom(buf); err == nil {
 			// make sure the packet is from the same source
+			if n == 0 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
 			if src == "" { // set source address
 				src = addr.String()
 			} else if addr.String() != src {
@@ -55,7 +59,8 @@ func (l *Listener) defaultMonitor() {
 	for {
 		if n, from, err := l.conn.ReadFrom(buf); err == nil {
 			if n == 0 {
-				return
+				time.Sleep(time.Millisecond)
+				continue
 			}
 			l.packetInput(buf[:n], from)
 		} else {

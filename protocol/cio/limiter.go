@@ -1,73 +1,112 @@
 package cio
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 
-	"golang.org/x/time/rate"
+	"github.com/chainreactors/rem/protocol/core"
 )
 
-var GlobalLimiter *Limiter
-
-func init() {
-	GlobalLimiter = NewLimiter(rate.Inf, rate.Inf, 1024*1024)
+// TokenBucketLimiter 基于令牌桶数量的限速器（手动恢复）
+type TokenBucketLimiter struct {
+	tokens     int64        // 当前令牌数量
+	enabled    atomic.Value // 限速开关
+	mu         sync.Mutex   // 保护令牌操作
+	cond       *sync.Cond   // 令牌到达通知
+	readCount  int64        // 读取计数器
+	writeCount int64        // 写入计数器
 }
 
-// Limiter 全局限速器
-type Limiter struct {
-	readLimiter  *rate.Limiter
-	writeLimiter *rate.Limiter
-	readEnabled  atomic.Value // 读限速开关
-	writeEnabled atomic.Value // 写限速开关
-	readCount    int64        // 读取计数器
-	writeCount   int64        // 写入计数器
-}
-
-func NewLimiter(readRate, writeRate rate.Limit, burstSize int) *Limiter {
-	l := &Limiter{
-		readLimiter:  rate.NewLimiter(readRate, burstSize),
-		writeLimiter: rate.NewLimiter(writeRate, burstSize),
+// NewTokenBucketLimiter 创建新的令牌桶限速器
+func NewTokenBucketLimiter(maxTokens int64, enable bool) *TokenBucketLimiter {
+	l := &TokenBucketLimiter{
+		tokens: maxTokens + int64(core.MaxPacketSize),
 	}
-	l.readEnabled.Store(false)
-	l.writeEnabled.Store(false)
+	l.cond = sync.NewCond(&l.mu)
+	l.enabled.Store(enable)
 	return l
 }
 
+// TryConsume 尝试消费指定数量的令牌（调用者必须持有 mu）
+func (l *TokenBucketLimiter) tryConsumeLocked(tokens int64) bool {
+	if l.tokens >= tokens {
+		l.tokens -= tokens
+		return true
+	}
+	return false
+}
+
+// TryConsume 尝试消费指定数量的令牌
+func (l *TokenBucketLimiter) TryConsume(tokens int64) bool {
+	if !l.IsEnabled() {
+		return true
+	}
+	l.mu.Lock()
+	ok := l.tryConsumeLocked(tokens)
+	l.mu.Unlock()
+	return ok
+}
+
+// WaitForTokens 等待获取指定数量的令牌
+func (l *TokenBucketLimiter) WaitForTokens(ctx context.Context, tokens int64) error {
+	if !l.IsEnabled() {
+		return nil
+	}
+
+	l.mu.Lock()
+	for !l.tryConsumeLocked(tokens) {
+		// Check context before waiting
+		select {
+		case <-ctx.Done():
+			l.mu.Unlock()
+			return ctx.Err()
+		default:
+		}
+		l.cond.Wait()
+	}
+	l.mu.Unlock()
+	return nil
+}
+
+// AddTokens 手动添加令牌
+func (l *TokenBucketLimiter) AddTokens(tokens int64) {
+	l.mu.Lock()
+	l.tokens += tokens
+	l.mu.Unlock()
+	l.cond.Broadcast()
+}
+
+// SetTokens 手动设置令牌数量
+func (l *TokenBucketLimiter) SetTokens(tokens int64) {
+	l.mu.Lock()
+	if tokens < 0 {
+		tokens = 0
+	}
+	l.tokens = tokens
+	l.mu.Unlock()
+	l.cond.Broadcast()
+}
+
+// Enable 启用/禁用限速
+func (l *TokenBucketLimiter) Enable(enable bool) {
+	l.enabled.Store(enable)
+}
+
+// IsEnabled 检查限速是否启用
+func (l *TokenBucketLimiter) IsEnabled() bool {
+	if val := l.enabled.Load(); val != nil {
+		return val.(bool)
+	}
+	return false
+}
+
 // GetCounts 获取读写计数
-func (l *Limiter) GetCounts() (readCount, writeCount int64) {
+func (l *TokenBucketLimiter) GetCounts() (readCount, writeCount int64) {
 	return atomic.LoadInt64(&l.readCount), atomic.LoadInt64(&l.writeCount)
 }
 
-// SetReadRate 设置读取速率
-func (l *Limiter) SetReadRate(readRate rate.Limit) {
-	l.readLimiter.SetLimit(readRate)
-}
-
-// SetWriteRate 设置写入速率
-func (l *Limiter) SetWriteRate(writeRate rate.Limit) {
-	l.writeLimiter.SetLimit(writeRate)
-}
-
-// EnableReadLimit 启用/禁用读限速
-func (l *Limiter) EnableReadLimit(enable bool) {
-	l.readEnabled.Store(enable)
-}
-
-// EnableWriteLimit 启用/禁用写限速
-func (l *Limiter) EnableWriteLimit(enable bool) {
-	l.writeEnabled.Store(enable)
-}
-
-// GetLimits 获取当前的限速设置
-func (l *Limiter) GetLimits() (readLimit, writeLimit rate.Limit) {
-	return l.readLimiter.Limit(), l.writeLimiter.Limit()
-}
-
-// IsReadEnabled 检查读限速是否启用
-func (l *Limiter) IsReadEnabled() bool {
-	return l.readEnabled.Load().(bool)
-}
-
-// IsWriteEnabled 检查写限速是否启用
-func (l *Limiter) IsWriteEnabled() bool {
-	return l.writeEnabled.Load().(bool)
+// GetTokens 获取当前令牌数量
+func (l *TokenBucketLimiter) GetTokens() int64 {
+	return l.tokens
 }

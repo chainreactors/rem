@@ -4,11 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/url"
 	"sync"
 
-	"github.com/chainreactors/proxyclient"
-	socksproxy "github.com/chainreactors/proxyclient/socks"
 	"github.com/chainreactors/rem/protocol/core"
 )
 
@@ -24,30 +21,6 @@ func init() {
 	core.ListenerRegister(core.MemoryTunnel, func(ctx context.Context) (core.TunnelListener, error) {
 		return &MemoryListener{meta: core.GetMetas(ctx)}, nil
 	})
-
-	// 注册 memory 作为代理协议
-	proxyclient.RegisterScheme("MEMORY", newMemoryProxyClient)
-}
-
-// 实现 DialFactory 函数
-func newMemoryProxyClient(proxyURL *url.URL, upstreamDial proxyclient.Dial) (proxyclient.Dial, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		// 首先获取内存通道连接
-		dialer := &MemoryDialer{meta: make(core.Metas)}
-
-		conf := &socksproxy.SOCKSConf{
-			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialer.Dial(proxyURL.Host)
-			},
-		}
-
-		client, err := socksproxy.NewClient(&url.URL{Scheme: "socks5"}, conf)
-		if err != nil {
-			return nil, err
-		}
-
-		return client.Dial(ctx, network, address)
-	}, nil
 }
 
 type MemoryBridge struct {
@@ -75,6 +48,14 @@ func (b *MemoryBridge) GetChannel(id string) (chan net.Conn, error) {
 
 type MemoryDialer struct {
 	meta core.Metas
+}
+
+func NewMemoryDialer(ctx context.Context) *MemoryDialer {
+	return &MemoryDialer{meta: core.GetMetas(ctx)}
+}
+
+func NewMemoryListener(ctx context.Context) *MemoryListener {
+	return &MemoryListener{meta: core.GetMetas(ctx)}
 }
 
 type MemoryListener struct {
@@ -114,6 +95,18 @@ func (l *MemoryListener) Listen(dst string) (net.Listener, error) {
 func (l *MemoryListener) Accept() (net.Conn, error) {
 	conn := <-l.connChan
 	return conn, nil
+}
+
+// TryAccept attempts a non-blocking accept. Returns (conn, nil, true) if a
+// connection was available, or (nil, nil, false) if none was pending.
+// Used by the TinyGo WASM polling loop where goroutine-based Accept blocks forever.
+func (l *MemoryListener) TryAccept() (net.Conn, error, bool) {
+	select {
+	case conn := <-l.connChan:
+		return conn, nil, true
+	default:
+		return nil, nil, false
+	}
 }
 
 func (l *MemoryListener) Close() error {

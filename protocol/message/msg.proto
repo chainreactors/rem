@@ -14,6 +14,7 @@ message Login {
     string Hostname = 10;
     string Username = 11;
     string Wrapper  = 13;
+    string ChannelRole = 14; // "up", "down", or empty (normal)
 }
 
 message Control {
@@ -66,5 +67,13 @@ message Redirect {
         ConnStart start = 10;
         Packet    packet = 11;
         ConnEnd   end = 12;
+        CWND      cwnd = 13;
     }
+}
+
+// Congestion Window
+message CWND{
+    uint64 Bridge = 1;
+    bool CWND = 2;
+    int64 Token = 3;
 }

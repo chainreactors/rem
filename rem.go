@@ -1,10 +1,15 @@
 package main
 
 import (
+	//_ "net/http/pprof"
+
 	"github.com/chainreactors/rem/cmd/cmd"
 )
 
-//go:generate protoc --go_out=paths=source_relative:. .\message\msg.proto
 func main() {
+	//go func() {
+	//	http.ListenAndServe("localhost:6060", nil)
+	//}()
+
 	cmd.RUN()
 }

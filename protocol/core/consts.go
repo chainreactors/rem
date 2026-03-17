@@ -1,12 +1,12 @@
 package core
 
 var (
-	MaxPacketSize = 1024 * 128
-	DefaultKey    = "nonenonenonenone"
+	MaxPacketSize       = 1024 * 128
+	MaxBufferSize int64 = int64(MaxPacketSize * 8)
+	DefaultKey          = "nonenonenonenone"
 
 	DefaultScheme       = "default"
 	DefaultConsoleProto = "tcp"
-	DefaultConsolePort  = "34996"
 	DefaultUsername     = "remno1"
 	DefaultPassword     = "0onmer"
 
@@ -32,17 +32,35 @@ const (
 
 // transport
 const (
-	ICMPTunnel      = "icmp"
-	HTTPTunnel      = "http"
-	UDPTunnel       = "udp"
-	TCPTunnel       = "tcp"
-	UNIXTunnel      = "unix"
-	WebSocketTunnel = "ws"
-	WireGuardTunnel = "wireguard"
-	MemoryTunnel    = "memory"
+	ICMPTunnel        = "icmp"
+	HTTPTunnel        = "http"
+	HTTP2Tunnel       = "http2"
+	StreamHTTPTunnel  = "streamhttp"
+	StreamHTTPSTunnel = "streamhttps"
+	UDPTunnel         = "udp"
+	TCPTunnel         = "tcp"
+	UNIXTunnel        = "unix"
+	WebSocketTunnel   = "ws"
+	WireGuardTunnel   = "wireguard"
+	MemoryTunnel      = "memory"
+	WASMTunnel        = "wasm"
+	DNSTunnel         = "dns"
+	SimplexTunnel     = "simplex"
+	OSSTunnel         = "oss"
 )
 
-func Normalize(s string) string {
+func DefaultTunnelPort(s string) string {
+	switch s {
+	case StreamHTTPTunnel, HTTP2Tunnel:
+		return "80"
+	case WebSocketTunnel, OSSTunnel, HTTPTunnel, StreamHTTPSTunnel, "http2s":
+		return "443"
+	default:
+		return "34996"
+	}
+}
+
+func NormalizeServe(s string) string {
 	switch s {
 	case "socks5", "s5", "socks":
 		return Socks5Serve
@@ -62,7 +80,8 @@ func Normalize(s string) string {
 		return WebSocketTunnel
 	case "wireguard", "wg":
 		return WireGuardTunnel
-
+	case "wasm":
+		return WASMTunnel
 	default:
 		return s
 	}
@@ -70,8 +89,7 @@ func Normalize(s string) string {
 
 // wrapper
 const (
-	XORWrapper     = "xor"
-	AESWrapper     = "aes"
+	CryptorWrapper = "cryptor"
 	PaddingWrapper = "padding"
 )
 
@@ -80,6 +98,12 @@ const (
 	Proxy   = "proxy"
 	Bind    = "bind"
 	Connect = "connect"
+)
+
+// duplex channel direction
+const (
+	DirUp   = "up"
+	DirDown = "down"
 )
 
 // agent type

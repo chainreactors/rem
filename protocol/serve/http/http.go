@@ -44,14 +44,12 @@ func NewHTTPProxyOutbound(opts map[string]string, dial core.ContextDialer) (core
 	hp := &HTTPProxy{
 		PluginOption: core.NewPluginOption(opts, core.OutboundPlugin, core.HTTPServe),
 		httpClient: &http.Client{
-			Transport: &http.Transport{
-				DialContext: dial.DialContext,
-			},
+			Transport: newHTTPTransport(dial),
 		},
 		dial: dial,
 	}
 
-	utils.Log.Importantf("[agent.outbound] %s", hp.URL())
+	utils.Log.Importantf("[agent.outbound] %s", hp.String())
 	return hp, nil
 }
 
@@ -75,20 +73,17 @@ func (hp *HTTPProxy) Handle(conn io.ReadWriteCloser, realConn net.Conn) (net.Con
 		}
 
 		return hp.handleConnect(request, wrapConn)
-	} else if strings.ToUpper(string(method)[:3]) == "GET" {
+	} else {
 		request, err := http.ReadRequest(reader)
 		if err != nil {
 			conn.Close()
 			return nil, err
 		}
-		err = hp.handlerGet(wrapConn, request)
+		err = hp.handleHTTP(wrapConn, request)
 		if err != nil {
 			return nil, err
 		}
 		return cio.WrapConn(realConn, conn), nil
-	} else {
-		conn.Close()
-		return nil, fmt.Errorf("unsupported method")
 	}
 }
 
@@ -130,7 +125,14 @@ func (hp *HTTPProxy) handlerRelay(reader *bufio.Reader, conn net.Conn, bridge io
 	}
 
 	// 修复请求主机的端口号
-	u, err := core.NewURL(request.URL.Scheme + "://" + request.URL.Host)
+	host := request.Host
+	if host == "" {
+		host = request.URL.Host
+	}
+	if host == "" {
+		host = request.RequestURI
+	}
+	u, err := core.NewURL("tcp://" + host)
 	if err != nil {
 		res := build400Response()
 		_ = res.Write(conn)
@@ -162,7 +164,7 @@ func (hp *HTTPProxy) handlerRelay(reader *bufio.Reader, conn net.Conn, bridge io
 	return cio.WrapConn(conn, rwc), nil
 }
 
-func (hp *HTTPProxy) handlerGet(rw io.ReadWriteCloser, req *http.Request) error {
+func (hp *HTTPProxy) handleHTTP(rw io.ReadWriteCloser, req *http.Request) error {
 	if ok := hp.Auth(req); !ok {
 		res := build407Response()
 		_ = res.Write(rw)
@@ -174,7 +176,7 @@ func (hp *HTTPProxy) handlerGet(rw io.ReadWriteCloser, req *http.Request) error 
 
 	removeProxyHeaders(req)
 
-	resp, err := hp.httpClient.Transport.RoundTrip(req)
+	resp, err := hp.httpClient.Do(req)
 	if err != nil {
 		res := build400Response()
 		_ = res.Write(rw)
@@ -190,7 +192,7 @@ func (hp *HTTPProxy) handlerGet(rw io.ReadWriteCloser, req *http.Request) error 
 	statusLine := fmt.Sprintf("HTTP/%d.%d %d %s\r\n", resp.ProtoMajor, resp.ProtoMinor, resp.StatusCode, http.StatusText(resp.StatusCode))
 	header.Write([]byte(statusLine))
 
-	// 构建并发送响应头, 复制响应头��客户端
+	// 构建并发送响应头, 复制响应头客户端
 	for key, values := range resp.Header {
 		for _, value := range values {
 			header.Write([]byte(fmt.Sprintf("%s: %s\r\n", key, value)))
@@ -238,24 +240,38 @@ func (hp *HTTPProxy) Auth(req *http.Request) bool {
 }
 
 func (hp *HTTPProxy) handleConnect(req *http.Request, rwc io.ReadWriteCloser) (net.Conn, error) {
-	defer rwc.Close()
 	if ok := hp.Auth(req); !ok {
 		res := build407Response()
 		_ = res.Write(rwc)
 		if res.Body != nil {
 			res.Body.Close()
 		}
+		_ = rwc.Close()
 		return nil, fmt.Errorf("auth failed")
 	}
 
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+	if host == "" {
+		host = req.RequestURI
+	}
+
 	// 修复请求主机的端口号
-	u, err := core.NewURL(req.URL.String())
+	u, err := core.NewURL("tcp://" + host)
 	if err != nil {
 		res := build400Response()
 		_ = res.Write(rwc)
+		_ = rwc.Close()
 		return nil, fmt.Errorf("host invalid")
 	}
 	u.FixPort()
+
+	if hp.dial == nil {
+		_ = rwc.Close()
+		return nil, fmt.Errorf("dialer not configured")
+	}
 
 	remote, err := hp.dial.Dial("tcp", u.Host)
 	if err != nil {
@@ -266,10 +282,13 @@ func (hp *HTTPProxy) handleConnect(req *http.Request, rwc io.ReadWriteCloser) (n
 			ProtoMinor: 1,
 		}
 		_ = res.Write(rwc)
+		_ = rwc.Close()
 		return nil, err
 	}
 	_, err = rwc.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	if err != nil {
+		remote.Close()
+		_ = rwc.Close()
 		return nil, err
 	}
 	return remote, nil

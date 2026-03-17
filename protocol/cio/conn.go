@@ -2,6 +2,8 @@ package cio
 
 import (
 	"context"
+	"errors"
+	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/x/utils"
 	"io"
 	"net"
@@ -70,6 +72,14 @@ func WrapConn(conn net.Conn, rwc io.ReadWriteCloser) net.Conn {
 	}
 }
 
+// WrapConnWithUnderlyingClose exposes rwc as a net.Conn while ensuring Close
+// also tears down the underlying transport.
+func WrapConnWithUnderlyingClose(conn net.Conn, rwc io.ReadWriteCloser) net.Conn {
+	return WrapConn(conn, WrapReadWriteCloser(rwc, rwc, func() error {
+		return closeAllIgnoreClosed(rwc, conn)
+	}))
+}
+
 type WrappedConn struct {
 	rwc io.ReadWriteCloser
 	net.Conn
@@ -85,6 +95,19 @@ func (conn *WrappedConn) Write(p []byte) (n int, err error) {
 
 func (conn *WrappedConn) Close() error {
 	return conn.rwc.Close()
+}
+
+func closeAllIgnoreClosed(closers ...io.Closer) error {
+	var errs []error
+	for _, closer := range closers {
+		if closer == nil {
+			continue
+		}
+		if err := closer.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 type ReadWriteCloser struct {
@@ -128,57 +151,46 @@ func (rwc *ReadWriteCloser) Close() error {
 	return nil
 }
 
-// LimitedConn 限速连接
+// LimitedConn 限速连接，每个连接有独立的限速器
 type LimitedConn struct {
 	net.Conn
 	ReadCount  int64
 	WriteCount int64
+	Reader     *TokenBucketLimiter
+	Writer     *TokenBucketLimiter
 }
 
 func NewLimitedConn(conn net.Conn) *LimitedConn {
 	return &LimitedConn{
-		Conn: conn,
+		Conn:   conn,
+		Reader: NewTokenBucketLimiter(core.MaxBufferSize, true),
+		Writer: NewTokenBucketLimiter(core.MaxBufferSize, false),
 	}
 }
 
 func (l *LimitedConn) Read(p []byte) (n int, err error) {
-	if !GlobalLimiter.IsReadEnabled() {
-		n, err = l.Conn.Read(p)
-		if n > 0 {
-			GlobalLimiter.readCount += int64(n)
-			atomic.AddInt64(&l.ReadCount, int64(n))
-		}
-		return
-	}
-
 	n, err = l.Conn.Read(p)
 	if n > 0 {
-		if err := GlobalLimiter.readLimiter.WaitN(context.Background(), n); err != nil {
+		// 等待令牌
+		if err := l.Reader.WaitForTokens(context.Background(), int64(n)); err != nil {
 			return n, err
 		}
-		GlobalLimiter.readCount += int64(n)
 		atomic.AddInt64(&l.ReadCount, int64(n))
+		atomic.AddInt64(&l.Reader.readCount, int64(n))
 	}
 	return
 }
 
 func (l *LimitedConn) Write(p []byte) (n int, err error) {
-	if !GlobalLimiter.IsWriteEnabled() {
-		n, err = l.Conn.Write(p)
-		if n > 0 {
-			GlobalLimiter.writeCount += int64(n)
-			atomic.AddInt64(&l.WriteCount, int64(n))
-		}
-		return
+	// 等待令牌
+	if err := l.Writer.WaitForTokens(context.Background(), int64(len(p))); err != nil {
+		return 0, err
 	}
 
 	n, err = l.Conn.Write(p)
 	if n > 0 {
-		if err := GlobalLimiter.writeLimiter.WaitN(context.Background(), n); err != nil {
-			return n, err
-		}
-		GlobalLimiter.writeCount += int64(n)
 		atomic.AddInt64(&l.WriteCount, int64(n))
+		atomic.AddInt64(&l.Writer.writeCount, int64(n))
 	}
 	return
 }

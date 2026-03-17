@@ -1,6 +1,7 @@
 package kcp
 
 import (
+	"github.com/chainreactors/rem/x/simplex"
 	"net"
 	"strings"
 
@@ -48,7 +49,7 @@ func (r *icmpResolver) ResolveAddr(network, address string) (net.Addr, error) {
 type simplexResolver struct{}
 
 func (r *simplexResolver) ResolveAddr(network, address string) (net.Addr, error) {
-	return ResolveSimplexAddr(network, address)
+	return simplex.ResolveSimplexAddr(network, address)
 }
 
 // 辅助函数:只返回host部分

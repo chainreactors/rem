@@ -2,21 +2,26 @@ package runner
 
 import (
 	"fmt"
-	"github.com/chainreactors/logs"
-	"github.com/chainreactors/proxyclient"
 	"net/http"
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/chainreactors/logs"
+	"github.com/chainreactors/proxyclient"
+	"github.com/chainreactors/rem/x/utils"
 )
 
 func TestNewConsole(t *testing.T) {
 	u, _ := url.Parse("rem+tcp://nonenonenonenone:@127.0.0.1:34996/?wrapper=raw")
 	proxy, err := proxyclient.NewClient(u)
+	if err != nil {
+		panic(err)
+	}
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			DialContext: proxy.DialContext,
+			DialContext: proxy,
 		},
 	}
 	_, err = client.Get("http://localhost:8000")
@@ -44,12 +49,42 @@ func TestClient(t *testing.T) {
 	}
 }
 
+func TestRemProxy(t *testing.T) {
+	remurl, _ := url.Parse("tcp://nonenonenonenone:@127.0.0.1:1234/?wrapper=raw")
+	client, err := newRemProxyClient(remurl, nil)
+	if err != nil {
+		return
+	}
+	dial, err := client(nil, "tcp", "127.0.0.1:1111")
+	if err != nil {
+		return
+	}
+	dial.Write([]byte("test"))
+}
+
+func TestRemHTTPProxy(t *testing.T) {
+	remurl, _ := url.Parse("tcp://nonenonenonenone:@127.0.0.1:1234/?wrapper=raw")
+	pc, err := newRemProxyClient(remurl, nil)
+	if err != nil {
+		return
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: pc,
+		},
+	}
+	_, err = client.Get("http://127.0.0.1:1111/")
+	if err != nil {
+		panic(err)
+	}
+}
+
 func TestServer(t *testing.T) {
 	utils.Log.SetLevel(logs.DebugLevel)
 	var server *Console
 	go func() {
 		var err error
-		server, err = NewConsoleWithCMD(" --debug -c tcp:///?wrapper=raw -i 127.0.0.1")
+		server, err = NewConsoleWithCMD(" --debug -s tcp://0.0.0.0:0/?wrapper=raw -i 127.0.0.1")
 		err = server.Run()
 		if err != nil {
 			fmt.Println(err.Error())

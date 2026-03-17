@@ -10,10 +10,10 @@ import (
 func init() {
 	core.DialerRegister(core.UNIXTunnel, func(ctx context.Context) (core.TunnelDialer, error) {
 		return NewUnixDialer(ctx), nil
-	})
+	}, "smb", "pipe", "unix", "sock")
 	core.ListenerRegister(core.UNIXTunnel, func(ctx context.Context) (core.TunnelListener, error) {
 		return NewUnixListener(ctx), nil
-	})
+	}, "smb", "pipe", "unix", "sock")
 }
 
 // UnixDialer 实现了 Dial 接口

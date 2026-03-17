@@ -2,19 +2,20 @@ package agent
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chainreactors/logs"
-	"github.com/chainreactors/proxyclient"
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/protocol/message"
 	"github.com/chainreactors/rem/x/utils"
-	"google.golang.org/protobuf/proto"
+	"github.com/chainreactors/rem/x/yamux"
 )
 
 var Agents = &agents{
@@ -23,6 +24,24 @@ var Agents = &agents{
 
 type agents struct {
 	*sync.Map
+}
+
+func (agent *Agent) SafeGoWithRestart(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				agent.Log("panic", logs.ErrorLevel, "critical goroutine %s panic: %v\n%s", name, r, debug.Stack())
+				agent.Close(fmt.Errorf("panic in %s: %v", name, r))
+				if agent.Recover != nil {
+					agent.Log("restart", logs.ImportantLevel, "triggering agent restart due to panic in %s", name)
+					if err := agent.Recover(); err != nil {
+						agent.Log("recover", logs.ErrorLevel, "failed to recover: %v", err)
+					}
+				}
+			}
+		}()
+		fn()
+	}()
 }
 
 func (as agents) Add(agent *Agent) {
@@ -41,9 +60,9 @@ func (as agents) Exist(id string) bool {
 	return ok
 }
 
-func (as agents) Send(id string, msg proto.Message) error {
+func (as agents) Send(id string, msg message.Message) error {
 	if agent, ok := as.Get(id); ok {
-		return agent.sendCh.Send(0, msg)
+		return agent.Send(msg)
 	}
 	return ErrNotFoundAgent
 }
@@ -51,12 +70,10 @@ func (as agents) Send(id string, msg proto.Message) error {
 func NewAgent(cfg *Config) (*Agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	agent := &Agent{
-		Config:    cfg,
-		ctx:       ctx,
-		canceler:  cancel,
-		sendCh:    cio.NewChan("SendCh", 1024),
-		receiveCh: cio.NewChan("ReceiveCh", 1024),
-		log:       utils.NewRingLogWriter(256),
+		Config:   cfg,
+		ctx:      ctx,
+		canceler: cancel,
+		log:      utils.NewRingLogWriter(256),
 	}
 	if cfg.Alias != "" {
 		agent.ID = cfg.Alias
@@ -73,31 +90,53 @@ func NewAgent(cfg *Config) (*Agent, error) {
 
 type Agent struct {
 	*Config
-	ID       string
-	Closed   bool
-	Outbound core.Outbound
-	Inbound  core.Inbound
-	Conn     net.Conn
-	Init     bool
+	ID            string
+	Closed        bool
+	Outbound      core.Outbound
+	Inbound       core.Inbound
+	Conn          net.Conn
+	Init          bool
+	Recover       func() error
+	TransportAddr net.Addr // underlying transport address (e.g. *SimplexAddr), used for dynamic reconfiguration
 
-	connCount int
-	connIndex uint64
-	receiveCh *cio.Channel // 接受msg的信道
-	sendCh    *cio.Channel // 发送msg的信道
-	ctx       context.Context
-	canceler  context.CancelFunc
-	client    proxyclient.Dial
-	bridgeMap sync.Map
-	listener  net.Listener
-	log       *utils.RingLogWriter
+	connCount      int64
+	connIndex      uint64
+	sharedBridgeID *uint64 // non-nil for forked agents; points to parent's connIndex
+	connIDSeq      atomic.Uint64
+	sessionConnID  string
+	session        *yamux.Session // yamux multiplexer over Conn
+	stream0        net.Conn       // tinygo poll mode uses stream0 directly
+	pendingStreams sync.Map       // map[uint64]net.Conn — data streams waiting for BridgeOpen
+	ctx            context.Context
+	canceler       context.CancelFunc
+	client         core.ContextDialer
+	bridgeMap      sync.Map
+	listener       net.Listener
+	log            *utils.RingLogWriter
+
+	connHub  *ConnHub
+	bgOnce   sync.Once
+	parent   *Agent   // non-nil for forked agents; used to check parent's pendingStreams
+	children sync.Map // map[string]*Agent — forked child agents (for message dispatch)
 }
 
 func (agent *Agent) Name() string {
 	return agent.ID
 }
 
-func (agent *Agent) Send(msg proto.Message) error {
-	return agent.sendCh.Send(0, msg)
+func (agent *Agent) nextConnID(label string) string {
+	if label == "" {
+		label = "conn"
+	}
+	index := agent.connIDSeq.Add(1) - 1
+	return fmt.Sprintf("%s-%d", label, index)
+}
+
+func (agent *Agent) Send(msg message.Message) error {
+	if agent.connHub == nil {
+		return fmt.Errorf("connhub not initialized")
+	}
+	return agent.connHub.SendControl(msg)
 }
 
 func (agent *Agent) Dial(remote, local *core.URL) (err error) {
@@ -114,7 +153,9 @@ func (agent *Agent) Dial(remote, local *core.URL) (err error) {
 	if agent.Redirect != "" {
 		control.Destination = agent.Redirect
 	}
+	agent.Conn.SetReadDeadline(time.Now().Add(LoginTimeout))
 	ack, err := cio.WriteAndAssertMsg(agent.Conn, control)
+	agent.Conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		return err
 	}
@@ -164,13 +205,13 @@ func (agent *Agent) ListenAndServe(dst *core.URL, control *message.Control) erro
 		return err
 	}
 	agent.Log("listen", logs.DebugLevel, "%s", dst.String())
-	go func() {
+	agent.SafeGoWithRestart("serve", func() {
 		err := agent.Serve(control)
 		if err != nil {
 			agent.Close(fmt.Errorf("%s accept error, %w", agent.Type, err))
 			return
 		}
-	}()
+	})
 	return nil
 }
 
@@ -182,12 +223,22 @@ func (agent *Agent) Accept() (net.Conn, error) {
 	return conn, nil
 }
 
+// LoginTimeout limits how long Login() / Dial() waits for the server's Ack.
+// On polling-based transports (OneDrive, SharePoint) the server may need
+// several poll cycles to discover the new client.  Keep this short-ish so
+// the caller's retry loop re-dials quickly with a fresh transport instance.
+var LoginTimeout = 60 * time.Second
+
 func (agent *Agent) Login(conn net.Conn) error {
 	// 向console 请求登录
-	token, err := utils.AesEncrypt(agent.AuthKey, utils.PKCS7Padding(agent.AuthKey, 16))
+	token, err := buildAuthToken(agent.AuthKey)
 	if err != nil {
 		return err
 	}
+
+	// Set a read deadline so Login doesn't block forever when the server
+	// hasn't discovered this client yet (common on polling transports).
+	conn.SetReadDeadline(time.Now().Add(LoginTimeout))
 
 	_, err = cio.WriteAndAssertMsg(conn, &message.Login{
 		Agent:        agent.ID,
@@ -195,75 +246,131 @@ func (agent *Agent) Login(conn net.Conn) error {
 		ConsoleIP:    agent.ConsoleURL.Hostname(),
 		ConsolePort:  agent.ConsoleURL.IntPort(),
 		Mod:          agent.Mod,
-		Token:        hex.EncodeToString(token),
+		Token:        token,
 		Interfaces:   agent.Interfaces,
 		Hostname:     agent.Hostname,
 		Username:     agent.Username,
 	})
 	if err != nil {
+		conn.SetReadDeadline(time.Time{}) // clear deadline on error path too
 		return err
 	}
 
+	// Clear deadline for subsequent I/O (yamux, keepalive, etc.)
+	conn.SetReadDeadline(time.Time{})
 	agent.Conn = conn
 	return nil
 }
 
 func (agent *Agent) Handler() error {
-	var err error
-	agent.client, err = proxyclient.NewClientChain(agent.Proxies) // client <-[proxies]-> target
+	if err := agent.HandlerInit(); err != nil {
+		return err
+	}
+	agent.StartBackgroundLoops()
+	return agent.handleMessage()
+}
+
+// StartBackgroundLoops starts the monitor and stream acceptor goroutines.
+// Safe to call multiple times (uses sync.Once internally).
+func (agent *Agent) StartBackgroundLoops() {
+	agent.bgOnce.Do(func() {
+		go agent.monitor()
+
+		// Accept incoming yamux streams (bridge data streams from peer)
+		agent.SafeGoWithRestart("streamAccept", func() {
+			agent.acceptStreams()
+		})
+	})
+}
+
+// HandlerInit performs synchronous initialization without entering the blocking
+// message loop.
+func (agent *Agent) HandlerInit() error {
+	if agent.Init {
+		return nil
+	}
+	err := agent.initProxyClient()
 	if err != nil {
 		return err
 	}
-	// 创建中转agent
-	if !agent.isDestination(agent.Controller.Destination) && agent.Type == core.SERVER {
-		agent.Type = core.Redirect
-		des, ok := Agents.Get(agent.Redirect)
-		if ok {
-			des.sendCh.Send(0, agent.Controller)
-		} else {
-			agent.Log("redirect", logs.ErrorLevel, "%s not found", agent.Redirect)
-		}
-	}
-	agent.Log("login", logs.DebugLevel, "login SUCCESSFULLY, %s connect ESTABLISHED, id: %s, des: %s", agent.ConsoleURL.Scheme, agent.Name(), agent.Redirect)
-	// 挂起sender与receiver, 用来与两端交换数据. 任何一端报错都会退出并重建连接.
-	go func() {
-		err := agent.sendCh.Sender(agent.Conn)
-		if err != nil {
-			agent.Close(fmt.Errorf("sender error, %w", err))
-		}
-	}()
-	go func() {
-		err := agent.receiveCh.Receiver(agent.Conn)
-		if err != nil {
-			agent.Close(fmt.Errorf("receiver error, %w", err))
-		}
-	}()
 
-	go agent.monitor()
+	// Create yamux session over the already-encrypted Conn
+	if err := agent.initYamux(); err != nil {
+		return err
+	}
+
+	agent.routeControl(agent.Controller)
+	agent.Log("login", logs.DebugLevel, "login SUCCESSFULLY, %s connect ESTABLISHED, id: %s, des: %s", agent.ConsoleURL.Scheme, agent.Name(), agent.Redirect)
 
 	if agent.Type != core.Redirect {
 		err = agent.handlerControl(agent.Controller)
 	}
 	if err != nil {
+		agent.Close(err)
 		return err
 	}
 	agent.Init = true
+	return nil
+}
+
+// HandleMessages runs the blocking message loop. Call after HandlerInit().
+func (agent *Agent) HandleMessages() error {
 	return agent.handleMessage()
+}
+
+func (agent *Agent) forwardControl(control *message.Control, destination string) {
+	if destination == "" {
+		agent.Log("redirect", logs.ErrorLevel, "empty destination for control source=%s", control.Source)
+		return
+	}
+	if destination == agent.ID {
+		agent.Log("redirect", logs.ErrorLevel, "reject self-forward loop for %s", destination)
+		return
+	}
+	if des, ok := Agents.Get(destination); ok {
+		if err := des.Send(control); err == nil {
+			agent.Log("redirect", logs.DebugLevel, "forward control source=%s to %s", control.Source, destination)
+			return
+		} else {
+			agent.Log("redirect", logs.ErrorLevel, "forward control source=%s to %s failed: %v", control.Source, destination, err)
+		}
+		return
+	}
+	agent.Log("redirect", logs.ErrorLevel, "%s not found", destination)
+}
+
+func (agent *Agent) routeControl(control *message.Control) bool {
+	if control == nil {
+		return false
+	}
+	if agent.Type == core.CLIENT {
+		return false
+	}
+	if agent.isDestination(control.Destination) {
+		return false
+	}
+	agent.Type = core.Redirect
+	agent.forwardControl(control, control.Destination)
+	return true
 }
 
 func (agent *Agent) Fork(ctrl *message.Control) (*Agent, error) {
 	cfg := agent.Config.Clone(ctrl)
 	ctx, cancel := context.WithCancel(agent.ctx)
 	a := &Agent{
-		Config:    cfg,
-		ID:        cfg.Alias,
-		ctx:       ctx,
-		canceler:  cancel,
-		Conn:      agent.Conn,
-		client:    agent.client,
-		sendCh:    agent.sendCh,
-		receiveCh: cio.NewChan("ReceiveCh", 1024),
-		log:       agent.log,
+		Config:  cfg,
+		ID:      cfg.Alias,
+		Conn:    agent.Conn,
+		Recover: agent.Recover,
+
+		ctx:            ctx,
+		canceler:       cancel,
+		client:         agent.client,
+		session:        agent.session, // share parent's yamux session
+		log:            agent.log,
+		connHub:        agent.connHub,
+		parent:         agent,
+		sharedBridgeID: &agent.connIndex, // share parent's bridge ID counter
 	}
 
 	err := a.handlerControl(ctrl)
@@ -272,12 +379,13 @@ func (agent *Agent) Fork(ctrl *message.Control) (*Agent, error) {
 	}
 
 	go a.monitor()
-	go func() {
-		err := a.handleMessage()
-		if err != nil {
-			return
-		}
-	}()
+	a.Init = true
+
+	// Register child in parent for message dispatch.
+	// The parent's handleMessage() routes BridgeOpen/BridgeClose to children
+	// instead of each child running its own handleMessage() on the shared controlInbox.
+	agent.children.Store(a.ID, a)
+
 	return a, nil
 }
 
@@ -293,7 +401,7 @@ func (agent *Agent) handlerInbound(local, remote *core.URL, control *message.Con
 
 	options := utils.MergeMaps(control.Options, local.Options())
 	options["server"] = agent.ExternalIP
-	if local.Scheme == core.PortForwardServe {
+	if local.Scheme == core.PortForwardServe || local.Scheme == core.RawServe {
 		options["src"] = local.Host
 		options["dest"] = remote.Host
 	}
@@ -321,7 +429,7 @@ func (agent *Agent) handlerOutbound(local, remote *core.URL, control *message.Co
 		options["dest"] = local.Host
 	}
 
-	instant, err := core.OutboundCreate(local.Scheme, options, core.NewProxyDialer(agent.client))
+	instant, err := core.OutboundCreate(local.Scheme, options, agent.client)
 	if err != nil {
 		agent.Log("outbound.create", logs.ErrorLevel, "%s", err.Error())
 		return err
@@ -370,101 +478,138 @@ func (agent *Agent) handlerControl(control *message.Control) error {
 }
 
 func (agent *Agent) handleMessage() error {
+	if agent.connHub == nil {
+		return fmt.Errorf("connhub not initialized")
+	}
+	inbox := agent.connHub.ControlInbox()
+	errs := agent.connHub.ControlErrors()
+
+	keepaliveTicker := time.NewTicker(KeepaliveInterval)
+	defer keepaliveTicker.Stop()
+	missedPongs := 0 // consecutive pings without pong reply
+
 	for {
+		var msg message.Message
 		select {
-		case msg, ok := <-agent.receiveCh.C:
-			if !ok {
-				return fmt.Errorf("receiver Closed")
+		case <-agent.ctx.Done():
+			if agent.Closed {
+				return nil
 			}
-			switch m := msg.Message.(type) {
-			case *message.Pong:
-				agent.Log("pong", logs.DebugLevel, "pong %s", m.Pong)
-			case *message.Ping:
-				agent.Log("ping", logs.DebugLevel, "ping %s", m.Ping)
-				pmsg := &message.Pong{
-					Pong: "pong",
+			return fmt.Errorf("agent stopped")
+		case err := <-errs:
+			if err == nil {
+				err = fmt.Errorf("all control streams closed")
+			}
+			if agent.Closed {
+				return nil
+			}
+			return fmt.Errorf("all control streams closed: %w", err)
+		case <-keepaliveTicker.C:
+			// Only CLIENT performs keepalive checking; server only responds to pings.
+			if agent.Type != core.CLIENT {
+				continue
+			}
+			missedPongs++
+			if missedPongs >= KeepaliveMaxMissed {
+				return fmt.Errorf("keepalive timeout: %d consecutive pings unanswered", missedPongs)
+			}
+			// Send ping in a goroutine so a blocked yamux write cannot
+			// stall the select loop — the counter keeps incrementing
+			// and will eventually kill the agent even if Send hangs.
+			go func() {
+				if err := agent.Send(&message.Ping{Ping: "keepalive"}); err != nil {
+					agent.Log("keepalive", logs.ErrorLevel, "failed to send ping: %v", err)
 				}
-				err := agent.Send(pmsg)
+			}()
+		case msg = <-inbox:
+		}
+		if msg == nil {
+			continue
+		}
+		switch m := msg.(type) {
+		case *message.Pong:
+			missedPongs = 0
+			agent.Log("pong", logs.DebugLevel, "pong %s", m.Pong)
+		case *message.Ping:
+			agent.Log("ping", logs.DebugLevel, "ping %s", m.Ping)
+			if err := agent.Send(&message.Pong{Pong: "pong"}); err != nil {
+				return err
+			}
+		case *message.BridgeOpen:
+			// Route to child agent if the source matches a forked child.
+			if child := agent.findChildForBridge(m.Source); child != nil {
+				child.handleBridgeOpen(m)
+			} else {
+				agent.handleBridgeOpen(m)
+			}
+		case *message.BridgeClose:
+			// Try parent first, then children.
+			target := agent
+			if _, err := agent.getBridge(m.ID); err != nil {
+				agent.children.Range(func(_, v interface{}) bool {
+					child := v.(*Agent)
+					if _, err := child.getBridge(m.ID); err == nil {
+						target = child
+						return false
+					}
+					return true
+				})
+			}
+			if bridge, err := target.getBridge(m.ID); err == nil {
+				go func() {
+					if !bridge.closed.Load() {
+						bridge.Log("end", logs.DebugLevel, "bridge %d closed by remote", m.ID)
+						bridge.Close()
+					}
+					target.bridgeMap.Delete(bridge.id)
+				}()
+			} else {
+				agent.releaseBridgeRoute(m.ID)
+			}
+		case *message.Control:
+			if agent.Type != core.CLIENT && agent.routeControl(m) {
+				continue
+			}
+			if m.Fork {
+				a, err := agent.Fork(m)
 				if err != nil {
-					return err
-				}
-			case *message.ConnStart:
-				bridge, err := NewBridgeWithMsg(agent, m)
-				if err != nil {
-					bridge.Log("start", logs.DebugLevel, "connect failed: %s", err.Error())
-					return err
-				}
-				agent.saveBridge(bridge)
-			case *message.ConnEnd:
-				if bridge, err := agent.getBridge(m.ID); err == nil {
-					go func() {
-						if !bridge.closed {
-							bridge.Log("end", logs.DebugLevel, "bridge %d closed by remote: %s", m.ID, m.Msg)
-							bridge.Close()
-						}
-						agent.bridgeMap.Delete(bridge.id)
-					}()
+					agent.Log("failed", logs.ErrorLevel, "%s", err.Error())
 				} else {
-					agent.Log("end", logs.DebugLevel, "bridge %d not found", m.ID)
-				}
-			case *message.Packet:
-				if bridge, err := agent.getBridge(m.ID); err == nil {
-					select {
-					case <-agent.ctx.Done():
-						break
-					default:
-						if _, err := bridge.buf.Write(m.Data); err != nil {
-							bridge.Log("write", logs.DebugLevel, "bridge %d write failed: %v", m.ID, err)
-							bridge.Close()
-						} else {
-							bridge.recvSum += int64(len(m.Data))
-						}
-					}
-				} else {
-					agent.Log("write", logs.DebugLevel, "bridge %d not found", m.ID)
-				}
-
-			case *message.Redirect:
-				if m.Destination == m.Source {
-					if des, ok := Agents.Get(m.Destination); ok {
-						des.receiveCh.Send(0, message.Unwrap(m))
-					} else {
-						agent.Log("redirect", logs.ErrorLevel, "%s not found", m.Destination)
-					}
-				} else if m.Destination == agent.ID {
-					agent.receiveCh.C <- &cio.Message{Message: message.Unwrap(m)}
-					continue
-				} else {
-					if des, ok := Agents.Get(m.Destination); ok {
-						des.sendCh.Send(0, message.Unwrap(m))
-					} else {
-						agent.Log("redirect", logs.ErrorLevel, "%s not found", m.Destination)
-					}
-				}
-
-			case *message.Control:
-				if m.Fork {
-					a, err := agent.Fork(m)
-					if err != nil {
-						agent.Log("failed", logs.ErrorLevel, "%s", err.Error())
-					}
 					Agents.Add(a)
-				} else {
-					err := agent.handlerControl(m)
-					if err != nil {
-						agent.Log("failed", logs.ErrorLevel, "%s", err.Error())
-					}
 				}
-
-			default:
-				agent.Log("message", logs.DebugLevel, "error msg type")
+			} else {
+				if err := agent.handlerControl(m); err != nil {
+					agent.Log("failed", logs.ErrorLevel, "%s", err.Error())
+				}
 			}
+		case *message.Reconfigure:
+			agent.handleReconfigure(m)
+		default:
+			agent.Log("message", logs.DebugLevel, "unknown msg type on control stream")
 		}
 	}
 }
 
+// configurable is satisfied by types that support dynamic option updates (e.g. *simplex.SimplexAddr).
+// Defined locally to avoid importing x/simplex.
+type configurable interface {
+	SetOption(key, value string)
+}
+
+func (agent *Agent) handleReconfigure(m *message.Reconfigure) {
+	cfg, ok := agent.TransportAddr.(configurable)
+	if !ok {
+		agent.Log("reconfigure", logs.ErrorLevel, "transport addr %T does not support SetOption", agent.TransportAddr)
+		return
+	}
+	for k, v := range m.Options {
+		cfg.SetOption(k, v)
+		agent.Log("reconfigure", logs.ImportantLevel, "set %s=%s", k, v)
+	}
+}
+
 func (agent *Agent) saveBridge(bridge *Bridge) {
-	agent.connCount++
+	atomic.AddInt64(&agent.connCount, 1)
 	agent.bridgeMap.Store(bridge.id, bridge)
 	bridge.Handler(agent)
 }
@@ -482,12 +627,9 @@ func (agent *Agent) getBridge(id uint64) (*Bridge, error) {
 func (agent *Agent) monitor() {
 	for !agent.Closed {
 		select {
-		case <-time.After(monitorInterval * time.Second):
-			agent.Log("monitor", logs.DebugLevel, "connections: %d/%d, sender: %s, receiver: %s",
-				agent.connCount, agent.connIndex,
-				agent.sendCh.GetStats(),
-				agent.receiveCh.GetStats(),
-			)
+		case <-utils.After(monitorInterval * time.Second):
+			agent.Log("monitor", logs.DebugLevel, "connections: %d/%d",
+				atomic.LoadInt64(&agent.connCount), atomic.LoadUint64(&agent.connIndex))
 		}
 	}
 }
@@ -497,10 +639,18 @@ func (agent *Agent) Close(err error) {
 		return
 	}
 	agent.Closed = true
-	agent.Log("exit", logs.ImportantLevel, "%s: %s", agent.ID, err.Error())
+	if err != nil {
+		agent.Log("exit", logs.ImportantLevel, "%s: %s", agent.ID, err.Error())
+	} else {
+		agent.Log("exit", logs.ImportantLevel, "%s: closed normally", agent.ID)
+	}
 	agent.canceler()
-	agent.sendCh.Close()
-	agent.receiveCh.Close()
+	if agent.connHub != nil {
+		agent.connHub.Close()
+	}
+	if agent.session != nil {
+		agent.session.Close()
+	}
 	if agent.listener != nil {
 		agent.listener.Close()
 	}
@@ -514,15 +664,272 @@ func (agent *Agent) Log(part string, level logs.Level, msg string, s ...interfac
 }
 
 func (agent *Agent) Metrics() string {
-	return fmt.Sprintf("connections: %d, sender: %s, receiver: %s",
-		agent.connCount,
-		agent.sendCh.GetStats(),
-		agent.receiveCh.GetStats(),
-	)
+	return fmt.Sprintf("connections: %d/%d", atomic.LoadInt64(&agent.connCount), atomic.LoadUint64(&agent.connIndex))
 }
 
 func (agent *Agent) HistoryLog() string {
 	return agent.log.String()
+}
+
+// initYamux creates a yamux session over agent.Conn and opens stream 0 (control).
+// CLIENT is the yamux client (opens streams), SERVER is the yamux server (accepts streams).
+func (agent *Agent) initYamux() error {
+	cfg := yamux.DefaultConfig()
+	cfg.LogOutput = io.Discard
+	cfg.EnableKeepAlive = false          // application-level keepalive is the sole liveness mechanism
+	cfg.ConnectionWriteTimeout = 24 * time.Hour // no yamux-level write timeout; keepalive governs liveness
+	cfg.StreamOpenTimeout = 24 * time.Hour      // no yamux-level stream timeout; keepalive governs liveness
+
+	var err error
+	if agent.Type == core.CLIENT {
+		agent.session, err = yamux.Client(agent.Conn, cfg)
+		if err != nil {
+			return fmt.Errorf("yamux client: %w", err)
+		}
+	} else {
+		agent.session, err = yamux.Server(agent.Conn, cfg)
+		if err != nil {
+			return fmt.Errorf("yamux server: %w", err)
+		}
+	}
+
+	algo := agent.LoadBalance
+	if algo == "" && agent.Params != nil {
+		algo = agent.Params["lb"]
+	}
+	if agent.connHub == nil {
+		agent.connHub = NewConnHub(algo)
+	} else if algo != "" {
+		agent.connHub.SetAlgorithm(algo)
+	}
+	connID := agent.nextConnID(agent.ConsoleURL.Scheme)
+	agent.sessionConnID = connID
+	if agent.Type == core.CLIENT {
+		controlStream, addErr := agent.connHub.AddClientConn(connID, agent.ConsoleURL.Scheme, agent.Conn, agent.session)
+		if addErr != nil {
+			return addErr
+		}
+		agent.setControlStream(controlStream)
+		return nil
+	}
+	controlStream, addErr := agent.connHub.AddServerConn(connID, agent.ConsoleURL.Scheme, agent.Conn, agent.session)
+	if addErr != nil {
+		return addErr
+	}
+	agent.setControlStream(controlStream)
+	return nil
+}
+
+// acceptStreams accepts incoming yamux data streams and associates them with bridges.
+func (agent *Agent) acceptStreams() {
+	connID := agent.sessionConnID
+	if connID == "" {
+		connID = agent.nextConnID(agent.ConsoleURL.Scheme)
+		agent.sessionConnID = connID
+	}
+	agent.acceptStreamsForSession(connID, agent.session)
+}
+
+func (agent *Agent) acceptStreamsForSession(connID string, session *yamux.Session) {
+	for {
+		stream, err := session.Accept()
+		if err != nil {
+			if agent.connHub != nil {
+				agent.connHub.MarkUnhealthy(connID)
+				agent.connHub.RemoveConn(connID)
+			}
+			if !agent.Closed {
+				// Don't call agent.Close() here — RemoveConn already notifies
+				// handleMessage via controlErrs channel.
+				agent.Log("stream", logs.DebugLevel, "channel %s closed: %v", connID, err)
+			}
+			return
+		}
+		go agent.handleDataStream(stream)
+	}
+}
+
+func (agent *Agent) AttachConn(conn net.Conn, label string) error {
+	if conn == nil {
+		return fmt.Errorf("nil conn")
+	}
+	if agent.connHub == nil || agent.session == nil {
+		return fmt.Errorf("agent not initialized")
+	}
+	return agent.attachConnNow(conn, label)
+}
+
+func (agent *Agent) attachConnNow(conn net.Conn, label string) error {
+	cfg := yamux.DefaultConfig()
+	cfg.LogOutput = io.Discard
+	cfg.EnableKeepAlive = false          // application-level keepalive is the sole liveness mechanism
+	cfg.ConnectionWriteTimeout = 24 * time.Hour // no yamux-level write timeout; keepalive governs liveness
+	cfg.StreamOpenTimeout = 24 * time.Hour      // no yamux-level stream timeout; keepalive governs liveness
+
+	var (
+		session *yamux.Session
+		err     error
+	)
+	if agent.Type == core.CLIENT {
+		session, err = yamux.Client(conn, cfg)
+	} else {
+		session, err = yamux.Server(conn, cfg)
+	}
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+
+	connID := agent.nextConnID(label)
+	var (
+		addErr        error
+		controlStream net.Conn
+	)
+	if agent.Type == core.CLIENT {
+		controlStream, addErr = agent.connHub.AddClientConn(connID, label, conn, session)
+	} else {
+		controlStream, addErr = agent.connHub.AddServerConn(connID, label, conn, session)
+	}
+	if addErr != nil {
+		_ = session.Close()
+		_ = conn.Close()
+		return addErr
+	}
+	agent.setControlStream(controlStream)
+
+	agent.SafeGoWithRestart("streamAccept."+connID, func() {
+		agent.acceptStreamsForSession(connID, session)
+	})
+	return nil
+}
+
+func (agent *Agent) openBridgeStream(bridgeID uint64) (net.Conn, string, error) {
+	if agent.connHub != nil {
+		return agent.connHub.OpenStream(bridgeID)
+	}
+	stream, err := agent.session.Open()
+	if err != nil {
+		return nil, "", err
+	}
+	return stream, "", nil
+}
+
+func (agent *Agent) releaseBridgeRoute(bridgeID uint64) {
+	if agent.connHub != nil {
+		agent.connHub.ReleaseBridge(bridgeID)
+	}
+}
+
+func (agent *Agent) ConnHubStats() []ConnHubConnStat {
+	if agent.connHub == nil {
+		return nil
+	}
+	return agent.connHub.Stats()
+}
+
+// readStreamID reads the 8-byte little-endian bridge ID header from a yamux data stream.
+func readStreamID(stream net.Conn) (uint64, error) {
+	var buf [8]byte
+	if _, err := io.ReadFull(stream, buf[:]); err != nil {
+		return 0, err
+	}
+	return uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24 |
+		uint64(buf[4])<<32 | uint64(buf[5])<<40 | uint64(buf[6])<<48 | uint64(buf[7])<<56, nil
+}
+
+// writeStreamID writes the 8-byte little-endian bridge ID header to a yamux data stream.
+func writeStreamID(stream net.Conn, id uint64) error {
+	var buf [8]byte
+	buf[0] = byte(id)
+	buf[1] = byte(id >> 8)
+	buf[2] = byte(id >> 16)
+	buf[3] = byte(id >> 24)
+	buf[4] = byte(id >> 32)
+	buf[5] = byte(id >> 40)
+	buf[6] = byte(id >> 48)
+	buf[7] = byte(id >> 56)
+	_, err := stream.Write(buf[:])
+	return err
+}
+
+// handleDataStream reads the bridge ID from an accepted yamux data stream.
+// If the bridge already exists (BridgeOpen arrived first), attach and start.
+// Otherwise, park the stream in pendingStreams for handleBridgeOpen to pick up.
+// Also checks forked children's bridgeMaps since they share the same yamux session.
+func (agent *Agent) handleDataStream(stream net.Conn) {
+	id, err := readStreamID(stream)
+	if err != nil {
+		agent.Log("stream", logs.DebugLevel, "read bridge ID: %v", err)
+		stream.Close()
+		return
+	}
+
+	// Check parent's bridgeMap first.
+	if bridge, err := agent.getBridge(id); err == nil {
+		bridge.stream = stream
+		bridge.Handler(agent)
+		return
+	}
+
+	// Check children's bridgeMaps.
+	var found bool
+	agent.children.Range(func(_, v interface{}) bool {
+		child := v.(*Agent)
+		if bridge, err := child.getBridge(id); err == nil {
+			bridge.stream = stream
+			bridge.Handler(child)
+			found = true
+			return false
+		}
+		return true
+	})
+	if found {
+		return
+	}
+
+	// BridgeOpen hasn't arrived yet — park the stream in parent's pendingStreams.
+	// handleBridgeOpen (dispatched by parent) will check here.
+	agent.pendingStreams.Store(id, stream)
+}
+
+// handleBridgeOpen processes a BridgeOpen received on stream 0.
+// Creates the bridge, then checks if a data stream already arrived (race).
+func (agent *Agent) handleBridgeOpen(m *message.BridgeOpen) {
+	ctx, cancel := context.WithCancel(agent.ctx)
+	bridge := &Bridge{
+		id:          m.ID,
+		source:      agent.ID,
+		destination: m.Source,
+		ctx:         ctx,
+		cancel:      cancel,
+		agent:       agent,
+	}
+
+	go func() {
+		select {
+		case <-bridge.ctx.Done():
+			atomic.AddInt64(&agent.connCount, -1)
+		case <-agent.ctx.Done():
+			bridge.Close()
+		}
+	}()
+
+	atomic.AddInt64(&agent.connCount, 1)
+	agent.bridgeMap.Store(bridge.id, bridge)
+
+	// Check if the data stream already arrived before this BridgeOpen.
+	// Data streams are parked in the parent's pendingStreams (since acceptStreams
+	// runs on the parent), so check there for forked children.
+	if v, ok := agent.pendingStreams.LoadAndDelete(m.ID); ok {
+		bridge.stream = v.(net.Conn)
+		bridge.Handler(agent)
+	} else if agent.parent != nil {
+		if v, ok := agent.parent.pendingStreams.LoadAndDelete(m.ID); ok {
+			bridge.stream = v.(net.Conn)
+			bridge.Handler(agent)
+		}
+	}
+	// Otherwise, handleDataStream will find the bridge when the stream arrives
 }
 
 func (agent *Agent) isDestination(redirect string) bool {
@@ -534,6 +941,23 @@ func (agent *Agent) isDestination(redirect string) bool {
 		return true
 	}
 	return false
+}
+
+// getChild returns a forked child agent by ID, or nil if not found.
+func (agent *Agent) getChild(id string) *Agent {
+	if v, ok := agent.children.Load(id); ok {
+		return v.(*Agent)
+	}
+	return nil
+}
+
+// findChildForBridge checks if a BridgeOpen/BridgeClose message should be
+// dispatched to a child agent. Returns the child agent or nil.
+func (agent *Agent) findChildForBridge(source string) *Agent {
+	if child := agent.getChild(source); child != nil {
+		return child
+	}
+	return nil
 }
 
 func (agent *Agent) isAccept(control *message.Control) bool {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/x/socks5"
@@ -20,13 +21,13 @@ func NewForwardInbound(params map[string]string) (core.Inbound, error) {
 	if !ok {
 		return nil, fmt.Errorf("dest not found")
 	}
-	ip, port := utils.SplitAddr(dest)
+	relay, err := newRelayRequest(dest)
+	if err != nil {
+		return nil, err
+	}
 	utils.Log.Importantf("[agent.inbound] portforward serving: %s -> %s", params["src"], dest)
 	return &ForwardPlugin{
-		Dest: &socks5.RelayRequest{DestAddr: &socks5.AddrSpec{
-			IP:   net.ParseIP(ip),
-			Port: port,
-		}},
+		Dest: relay,
 	}, nil
 }
 
@@ -35,15 +36,36 @@ func NewForwardOutbound(params map[string]string, dial core.ContextDialer) (core
 	if !ok {
 		return nil, fmt.Errorf("dest not found")
 	}
-	ip, port := utils.SplitAddr(dest)
+	relay, err := newRelayRequest(dest)
+	if err != nil {
+		return nil, err
+	}
 	utils.Log.Importantf("[agent.outbound] portforward serving: %s -> %s", dest, params["src"])
 	return &ForwardPlugin{
-		Dest: &socks5.RelayRequest{DestAddr: &socks5.AddrSpec{
-			IP:   net.ParseIP(ip),
-			Port: port,
-		}},
+		Dest: relay,
 		dial: dial,
 	}, nil
+}
+
+func newRelayRequest(dest string) (*socks5.RelayRequest, error) {
+	host, portText, err := net.SplitHostPort(dest)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dest %q: %w", dest, err)
+	}
+
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dest port %q: %w", dest, err)
+	}
+
+	addr := &socks5.AddrSpec{Port: port}
+	if ip := net.ParseIP(host); ip != nil {
+		addr.IP = ip
+	} else {
+		addr.FQDN = host
+	}
+
+	return &socks5.RelayRequest{DestAddr: addr}, nil
 }
 
 type ForwardPlugin struct {
@@ -52,7 +74,10 @@ type ForwardPlugin struct {
 }
 
 func (plug *ForwardPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn) (net.Conn, error) {
-	remote, err := plug.dial.Dial("tcp", plug.Dest.String())
+	if plug.dial == nil {
+		return nil, fmt.Errorf("dialer not configured")
+	}
+	remote, err := plug.dial.Dial("tcp", plug.Dest.DestAddr.Address())
 	if err != nil {
 		return nil, err
 	}

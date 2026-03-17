@@ -2,12 +2,22 @@ package core
 
 import (
 	"fmt"
-	"github.com/chainreactors/rem/x/utils"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/chainreactors/rem/x/utils"
 )
+
+func stripDirection(scheme string) (direction, remainder string) {
+	if strings.HasPrefix(scheme, DirUp+"-") {
+		return DirUp, scheme[len(DirUp)+1:]
+	}
+	if strings.HasPrefix(scheme, DirDown+"-") {
+		return DirDown, scheme[len(DirDown)+1:]
+	}
+	return "", scheme
+}
 
 func NewConsoleURL(u string) (*URL, error) {
 	// "" -> "tcp://0.0.0.0:34996"
@@ -25,16 +35,26 @@ func NewConsoleURL(u string) (*URL, error) {
 	}
 	parsed := &URL{URL: pu}
 	parsed.Scheme = strings.Replace(parsed.Scheme, "rem+", "", 1)
-	parsed.RawScheme = parsed.Scheme
-	parsed.Scheme = Normalize(parsed.Scheme)
+	parsed.Direction, parsed.Scheme = stripDirection(parsed.Scheme)
+	// 解析 scheme，支持别名展开
+	if ss := strings.Split(parsed.Scheme, "+"); len(ss) == 1 {
+		parsed.RawScheme = ss[0]
+		parsed.Scheme = ss[0]
+		parsed.Tunnel = ss[0]
+	} else {
+		parsed.RawScheme = ss[1]
+		parsed.Scheme = ss[1]
+		parsed.Tunnel = ss[0]
+	}
+
 	if parsed.Host == "" {
-		parsed.Host = "0.0.0.0:" + DefaultConsolePort
+		parsed.Host = "0.0.0.0:" + DefaultTunnelPort(parsed.Scheme)
 	}
 	if parsed.Hostname() == "" {
 		parsed.Host = "0.0.0.0:" + parsed.Port()
 	}
 	if parsed.Port() == "0" || parsed.Port() == "" {
-		parsed.Host = parsed.Hostname() + ":" + DefaultConsolePort
+		parsed.Host = parsed.Hostname() + ":" + DefaultTunnelPort(parsed.Scheme)
 	}
 
 	return parsed, nil
@@ -53,12 +73,12 @@ func NewURL(u string) (*URL, error) {
 	v := &URL{URL: parsed}
 	if ss := strings.Split(v.Scheme, "+"); len(ss) == 1 {
 		v.RawScheme = ss[0]
-		v.Scheme = Normalize(ss[0])
+		v.Scheme = NormalizeServe(ss[0])
 		v.Tunnel = "tcp"
 	} else {
 		v.RawScheme = ss[1]
-		v.Scheme = Normalize(ss[1])
-		v.Tunnel = Normalize(ss[0])
+		v.Scheme = NormalizeServe(ss[1])
+		v.Tunnel = NormalizeServe(ss[0])
 	}
 
 	if v.Host == "" {
@@ -104,6 +124,7 @@ type URL struct {
 	*url.URL
 	RawScheme string
 	Tunnel    string
+	Direction string // "up", "down", or "" (normal mode)
 }
 
 func (u *URL) Copy() *URL {
@@ -119,21 +140,10 @@ func (u *URL) Copy() *URL {
 			RawQuery:   u.RawQuery,
 			Fragment:   u.Fragment,
 		},
-		Tunnel: u.Tunnel,
+		RawScheme: u.RawScheme,
+		Tunnel:    u.Tunnel,
+		Direction: u.Direction,
 	}
-}
-
-func (u *URL) IP() net.IP {
-	host := u.Hostname()
-	if ip := net.ParseIP(host); ip != nil {
-		return ip
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-
-	return ips[0]
 }
 
 func (u *URL) PathString() string {
@@ -146,8 +156,11 @@ func (u *URL) Network() string {
 
 func (u *URL) String() string {
 	var buf strings.Builder
+	if u.Direction != "" {
+		buf.WriteString(u.Direction + "-")
+	}
 	if u.Scheme != "" {
-		if u.Tunnel != "" && u.Tunnel != "tcp" {
+		if u.Tunnel != "" && u.Tunnel != TCPTunnel && u.Tunnel != u.RawScheme {
 			buf.WriteString(u.Tunnel + "+")
 		}
 		if u.RawScheme != "" {
@@ -155,44 +168,98 @@ func (u *URL) String() string {
 		} else {
 			buf.WriteString(u.Scheme)
 		}
-		buf.WriteByte(':')
 	}
+	buf.WriteByte(':')
 	if u.Opaque != "" {
 		buf.WriteString(u.Opaque)
 	} else {
-		if u.Scheme != "" || u.Host != "" || u.User != nil {
-			if u.Host == "" && u.User == nil {
-				// omit empty host
-			} else {
-				if u.Host != "" || u.Path != "" || u.User != nil {
-					buf.WriteString("//")
-				}
-				if ui := u.User; ui != nil {
-					buf.WriteString(ui.String())
-					buf.WriteByte('@')
-				}
-				if h := u.Host; h != "" {
-					buf.WriteString(h)
-				}
-			}
-		}
-		path := u.EscapedPath()
-		if path != "" && path[0] != '/' && u.Host != "" {
-			buf.WriteByte('/')
-		}
-		if buf.Len() == 0 {
-			// RFC 3986 §4.2
-			// A path segment that contains a colon character (e.g., "this:that")
-			// cannot be used as the first segment of a relative-path reference, as
-			// it would be mistaken for a scheme name. Such a segment must be
-			// preceded by a dot-segment (e.g., "./this:that") to make a relative-
-			// path reference.
-			if segment, _, _ := strings.Cut(path, "/"); strings.Contains(segment, ":") {
-				buf.WriteString("./")
-			}
-		}
-		buf.WriteString(path)
+		buf.WriteString(u.iRawHost())
+		buf.WriteString(u.iRawPath())
 	}
+	if u.ForceQuery || u.RawQuery != "" {
+		buf.WriteByte('?')
+		buf.WriteString(u.RawQuery)
+	}
+	if u.Fragment != "" {
+		buf.WriteByte('#')
+		buf.WriteString(u.EscapedFragment())
+	}
+	return buf.String()
+}
+func (u *URL) iRawHost() string {
+	var buf strings.Builder
+	if u.Scheme != "" || u.Host != "" || u.User != nil {
+		if u.Host == "" && u.User == nil {
+			// omit empty host
+		} else {
+			if u.Host != "" || u.Path != "" || u.User != nil {
+				buf.WriteString("//")
+			}
+			if ui := u.User; ui != nil {
+				buf.WriteString(ui.String())
+				buf.WriteByte('@')
+			}
+			if h := u.Host; h != "" {
+				buf.WriteString(h)
+			}
+		}
+	}
+	return buf.String()
+}
+
+func (u *URL) iRawPath() string {
+	var buf strings.Builder
+	path := u.EscapedPath()
+	if path != "" && path[0] != '/' && u.Host != "" {
+		buf.WriteByte('/')
+	}
+	if buf.Len() == 0 {
+		// RFC 3986 §4.2
+		// A path segment that contains a colon character (e.g., "this:that")
+		// cannot be used as the first segment of a relative-path reference, as
+		// it would be mistaken for a scheme name. Such a segment must be
+		// preceded by a dot-segment (e.g., "./this:that") to make a relative-
+		// path reference.
+		if segment, _, _ := strings.Cut(path, "/"); strings.Contains(segment, ":") {
+			buf.WriteString("./")
+		}
+	}
+	buf.WriteString(path)
+	return buf.String()
+}
+
+func (u *URL) RawBaseURL() string {
+	var buf strings.Builder
+	if u.Scheme != "" {
+		buf.WriteString(u.Scheme)
+	} else {
+		buf.WriteString(u.RawScheme)
+	}
+	buf.WriteByte(':')
+	if u.Opaque != "" {
+		buf.WriteString(u.Opaque)
+	} else {
+		buf.WriteString(u.iRawHost())
+		buf.WriteString(u.iRawPath())
+	}
+	return buf.String()
+}
+
+func (u *URL) RawString() string {
+	var buf strings.Builder
+	if u.RawScheme != "" {
+		buf.WriteString(u.RawScheme)
+	} else {
+		buf.WriteString(u.Scheme)
+	}
+	buf.WriteByte(':')
+	if u.Opaque != "" {
+		buf.WriteString(u.Opaque)
+	} else {
+		buf.WriteString(u.iRawHost())
+		buf.WriteString(u.iRawPath())
+	}
+
 	if u.ForceQuery || u.RawQuery != "" {
 		buf.WriteByte('?')
 		buf.WriteString(u.RawQuery)
@@ -246,6 +313,11 @@ func (u *URL) SetHostname(hostname string) {
 	u.Host = fmt.Sprintf("%s:%s", hostname, u.Port())
 }
 
+func (u *URL) SetSchema(schema string) {
+	u.Scheme = schema
+	u.RawScheme = schema
+}
+
 func (u *URL) SplitAddr() (string, int) {
 	return utils.SplitAddr(u.Host)
 }
@@ -264,6 +336,14 @@ func (u *URL) SetQuery(key, value string) {
 
 func (u *URL) GetQuery(key string) string {
 	return u.Query().Get(key)
+}
+
+func (u *URL) PopQuery(key string) string {
+	queryParams := u.Query()
+	value := queryParams.Get(key)
+	queryParams.Del(key)
+	u.RawQuery = queryParams.Encode()
+	return value
 }
 
 func (u *URL) FixPort() {

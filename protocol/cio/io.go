@@ -2,8 +2,6 @@ package cio
 
 import (
 	"encoding/binary"
-	"google.golang.org/protobuf/proto"
-	"io"
 	"net"
 
 	"github.com/chainreactors/rem/protocol/core"
@@ -11,7 +9,7 @@ import (
 	"github.com/chainreactors/rem/x/utils"
 )
 
-func unpack(bs []byte, mType message.MsgType) (proto.Message, error) {
+func unpack(bs []byte, mType message.MsgType) (message.Message, error) {
 	if len(bs) == 0 {
 		return nil, message.ErrEmptyMessage
 	}
@@ -25,19 +23,19 @@ func unpack(bs []byte, mType message.MsgType) (proto.Message, error) {
 		return nil, message.WrapError(message.ErrUnknownType, "type: %d", mType)
 	}
 
-	if err := proto.Unmarshal(bs, msg); err != nil {
+	if err := msg.UnmarshalVT(bs); err != nil {
 		return nil, message.WrapError(message.ErrUnmarshal, err.Error())
 	}
 	return msg, nil
 }
 
-func pack(msg proto.Message) ([]byte, error) {
+func pack(msg message.Message) ([]byte, error) {
 	msgType := message.GetMessageType(msg)
 	if msgType == 0 {
 		return nil, message.ErrInvalidType
 	}
 
-	content, err := proto.Marshal(msg)
+	content, err := msg.MarshalVT()
 	if err != nil {
 		return nil, message.WrapError(message.ErrMarshal, err.Error())
 	}
@@ -49,12 +47,12 @@ func pack(msg proto.Message) ([]byte, error) {
 	return buf, nil
 }
 
-func WriteMsg(conn net.Conn, msg proto.Message) error {
+func WriteMsg(conn net.Conn, msg message.Message) error {
 	packedmsg, err := pack(msg)
 	if err != nil {
-		utils.Log.Debugf("pack error, %s", err.Error())
 		return err
 	}
+	defer PutBuf(packedmsg)
 	utils.Log.Logf(utils.IOLog, "[write] %s to %s, %d bytes\n",
 		conn.LocalAddr().String(), conn.RemoteAddr().String(), len(packedmsg))
 	utils.Log.Logf(utils.DUMPLog, "[write] %v", packedmsg)
@@ -67,11 +65,25 @@ func WriteMsg(conn net.Conn, msg proto.Message) error {
 	return err
 }
 
-func ReadMsg(conn net.Conn) (proto.Message, error) {
+// readFull reads exactly len(buf) bytes from conn without using io.ReadFull.
+// This avoids TinyGo WASM issues with io.Reader interface conversion.
+func readFull(conn net.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := conn.Read(buf[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func ReadMsg(conn net.Conn) (message.Message, error) {
 	header := GetBuf(5)
 	defer PutBuf(header)
 
-	_, err := io.ReadFull(conn, header)
+	_, err := readFull(conn, header)
 	if err != nil {
 		utils.Log.Logf(utils.IOLog, "[read] %s from %s: read greet error, %s\n",
 			conn.RemoteAddr().String(), conn.LocalAddr().String(), err.Error())
@@ -96,7 +108,7 @@ func ReadMsg(conn net.Conn) (proto.Message, error) {
 	bs := GetBuf(int(length))
 	defer PutBuf(bs)
 
-	n, err := io.ReadFull(conn, bs)
+	n, err := readFull(conn, bs)
 	if err != nil {
 		return nil, message.WrapError(message.ErrConnectionError, err.Error())
 	}
@@ -106,6 +118,7 @@ func ReadMsg(conn net.Conn) (proto.Message, error) {
 	}
 
 	msg, err := unpack(bs, mtype)
+
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +127,7 @@ func ReadMsg(conn net.Conn) (proto.Message, error) {
 	return msg, nil
 }
 
-func ReadAndAssertMsg(conn net.Conn, expect message.MsgType) (proto.Message, error) {
+func ReadAndAssertMsg(conn net.Conn, expect message.MsgType) (message.Message, error) {
 	msg, err := ReadMsg(conn)
 	if err != nil {
 		return nil, err
@@ -128,7 +141,7 @@ func ReadAndAssertMsg(conn net.Conn, expect message.MsgType) (proto.Message, err
 	return msg, nil
 }
 
-func WriteAndAssertMsg(conn net.Conn, msg proto.Message) (*message.Ack, error) {
+func WriteAndAssertMsg(conn net.Conn, msg message.Message) (*message.Ack, error) {
 	err := WriteMsg(conn, msg)
 	if err != nil {
 		return nil, err

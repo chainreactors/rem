@@ -23,22 +23,16 @@
 package kcp
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
-	"crypto/des"
 	"crypto/sha1"
+	"errors"
+	"fmt"
 	"unsafe"
 
+	"github.com/chainreactors/rem/x/cryptor"
 	xor "github.com/templexxx/xorsimd"
-	"github.com/tjfoc/gmsm/sm4"
-
-	"golang.org/x/crypto/blowfish"
-	"golang.org/x/crypto/cast5"
 	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/crypto/salsa20"
-	"golang.org/x/crypto/tea"
-	"golang.org/x/crypto/twofish"
-	"golang.org/x/crypto/xtea"
 )
 
 var (
@@ -50,6 +44,8 @@ var (
 	initialVector = []byte{167, 115, 79, 156, 18, 172, 27, 1, 164, 21, 242, 193, 252, 120, 230, 107}
 	saltxor       = `sH3CIVoF#rWLtJo6`
 )
+
+var errAlgorithmDisabled = errors.New("kcp: algorithm disabled by build tag")
 
 // BlockCrypt defines encryption/decryption methods for a given byte slice.
 // Notes on implementing: the data to be encrypted contains a builtin
@@ -64,185 +60,95 @@ type BlockCrypt interface {
 	Decrypt(dst, src []byte)
 }
 
+type blockCrypt struct {
+	encbuf []byte
+	decbuf []byte
+	block  cipher.Block
+}
+
+func newBlockCrypt(block cipher.Block) BlockCrypt {
+	blockSize := block.BlockSize()
+	return &blockCrypt{
+		encbuf: make([]byte, blockSize),
+		decbuf: make([]byte, 2*blockSize),
+		block:  block,
+	}
+}
+
+func (c *blockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf) }
+func (c *blockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf) }
+
+func newNamedBlockCrypt(name string, key []byte) (BlockCrypt, error) {
+	block, err := cryptor.BuildBlock(name, key)
+	if err != nil {
+		if errors.Is(err, cryptor.ErrBlockNotFound) {
+			return nil, fmt.Errorf("%w: %s", errAlgorithmDisabled, name)
+		}
+		return nil, err
+	}
+	return newBlockCrypt(block), nil
+}
+
+// NewAESBlockCrypt https://en.wikipedia.org/wiki/Advanced_Encryption_Standard
+func NewAESBlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("aes", key)
+}
+
+// NewSM4BlockCrypt https://github.com/tjfoc/gmsm/tree/master/sm4
+func NewSM4BlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("sm4", key)
+}
+
+// NewTwofishBlockCrypt https://en.wikipedia.org/wiki/Twofish
+func NewTwofishBlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("twofish", key)
+}
+
+// NewTripleDESBlockCrypt https://en.wikipedia.org/wiki/Triple_DES
+func NewTripleDESBlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("tripledes", key)
+}
+
+// NewCast5BlockCrypt https://en.wikipedia.org/wiki/CAST-128
+func NewCast5BlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("cast5", key)
+}
+
+// NewBlowfishBlockCrypt https://en.wikipedia.org/wiki/Blowfish_(cipher)
+func NewBlowfishBlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("blowfish", key)
+}
+
+// NewTEABlockCrypt https://en.wikipedia.org/wiki/Tiny_Encryption_Algorithm
+func NewTEABlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("tea", key)
+}
+
+// NewXTEABlockCrypt https://en.wikipedia.org/wiki/XTEA
+func NewXTEABlockCrypt(key []byte) (BlockCrypt, error) {
+	return newNamedBlockCrypt("xtea", key)
+}
+
 type salsa20BlockCrypt struct {
 	key [32]byte
 }
 
 // NewSalsa20BlockCrypt https://en.wikipedia.org/wiki/Salsa20
 func NewSalsa20BlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(salsa20BlockCrypt)
-	copy(c.key[:], key)
-	return c, nil
+	crypt := new(salsa20BlockCrypt)
+	copy(crypt.key[:], key)
+	return crypt, nil
 }
 
-func (c *salsa20BlockCrypt) Encrypt(dst, src []byte) {
-	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &c.key)
-	copy(dst[:8], src[:8])
-}
-func (c *salsa20BlockCrypt) Decrypt(dst, src []byte) {
-	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &c.key)
+func (crypt *salsa20BlockCrypt) Encrypt(dst, src []byte) {
+	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &crypt.key)
 	copy(dst[:8], src[:8])
 }
 
-type sm4BlockCrypt struct {
-	encbuf [sm4.BlockSize]byte // 64bit alignment enc/dec buffer
-	decbuf [2 * sm4.BlockSize]byte
-	block  cipher.Block
+func (crypt *salsa20BlockCrypt) Decrypt(dst, src []byte) {
+	salsa20.XORKeyStream(dst[8:], src[8:], src[:8], &crypt.key)
+	copy(dst[:8], src[:8])
 }
-
-// NewSM4BlockCrypt https://github.com/tjfoc/gmsm/tree/master/sm4
-func NewSM4BlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(sm4BlockCrypt)
-	block, err := sm4.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *sm4BlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *sm4BlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type twofishBlockCrypt struct {
-	encbuf [twofish.BlockSize]byte
-	decbuf [2 * twofish.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewTwofishBlockCrypt https://en.wikipedia.org/wiki/Twofish
-func NewTwofishBlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(twofishBlockCrypt)
-	block, err := twofish.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *twofishBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *twofishBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type tripleDESBlockCrypt struct {
-	encbuf [des.BlockSize]byte
-	decbuf [2 * des.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewTripleDESBlockCrypt https://en.wikipedia.org/wiki/Triple_DES
-func NewTripleDESBlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(tripleDESBlockCrypt)
-	block, err := des.NewTripleDESCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *tripleDESBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *tripleDESBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type cast5BlockCrypt struct {
-	encbuf [cast5.BlockSize]byte
-	decbuf [2 * cast5.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewCast5BlockCrypt https://en.wikipedia.org/wiki/CAST-128
-func NewCast5BlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(cast5BlockCrypt)
-	block, err := cast5.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *cast5BlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *cast5BlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type blowfishBlockCrypt struct {
-	encbuf [blowfish.BlockSize]byte
-	decbuf [2 * blowfish.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewBlowfishBlockCrypt https://en.wikipedia.org/wiki/Blowfish_(cipher)
-func NewBlowfishBlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(blowfishBlockCrypt)
-	block, err := blowfish.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *blowfishBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *blowfishBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type aesBlockCrypt struct {
-	encbuf [aes.BlockSize]byte
-	decbuf [2 * aes.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewAESBlockCrypt https://en.wikipedia.org/wiki/Advanced_Encryption_Standard
-func NewAESBlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(aesBlockCrypt)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *aesBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *aesBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type teaBlockCrypt struct {
-	encbuf [tea.BlockSize]byte
-	decbuf [2 * tea.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewTEABlockCrypt https://en.wikipedia.org/wiki/Tiny_Encryption_Algorithm
-func NewTEABlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(teaBlockCrypt)
-	block, err := tea.NewCipherWithRounds(key, 16)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *teaBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *teaBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
-
-type xteaBlockCrypt struct {
-	encbuf [xtea.BlockSize]byte
-	decbuf [2 * xtea.BlockSize]byte
-	block  cipher.Block
-}
-
-// NewXTEABlockCrypt https://en.wikipedia.org/wiki/XTEA
-func NewXTEABlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(xteaBlockCrypt)
-	block, err := xtea.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	c.block = block
-	return c, nil
-}
-
-func (c *xteaBlockCrypt) Encrypt(dst, src []byte) { encrypt(c.block, dst, src, c.encbuf[:]) }
-func (c *xteaBlockCrypt) Decrypt(dst, src []byte) { decrypt(c.block, dst, src, c.decbuf[:]) }
 
 type simpleXORBlockCrypt struct {
 	xortbl []byte
@@ -250,13 +156,13 @@ type simpleXORBlockCrypt struct {
 
 // NewSimpleXORBlockCrypt simple xor with key expanding
 func NewSimpleXORBlockCrypt(key []byte) (BlockCrypt, error) {
-	c := new(simpleXORBlockCrypt)
-	c.xortbl = pbkdf2.Key(key, []byte(saltxor), 32, mtuLimit, sha1.New)
-	return c, nil
+	crypt := &simpleXORBlockCrypt{}
+	crypt.xortbl = pbkdf2.Key(key, []byte(saltxor), 32, mtuLimit, sha1.New)
+	return crypt, nil
 }
 
-func (c *simpleXORBlockCrypt) Encrypt(dst, src []byte) { xor.Bytes(dst, src, c.xortbl) }
-func (c *simpleXORBlockCrypt) Decrypt(dst, src []byte) { xor.Bytes(dst, src, c.xortbl) }
+func (crypt *simpleXORBlockCrypt) Encrypt(dst, src []byte) { xor.Bytes(dst, src, crypt.xortbl) }
+func (crypt *simpleXORBlockCrypt) Decrypt(dst, src []byte) { xor.Bytes(dst, src, crypt.xortbl) }
 
 type noneBlockCrypt struct{}
 
@@ -265,8 +171,8 @@ func NewNoneBlockCrypt(key []byte) (BlockCrypt, error) {
 	return new(noneBlockCrypt), nil
 }
 
-func (c *noneBlockCrypt) Encrypt(dst, src []byte) { copy(dst, src) }
-func (c *noneBlockCrypt) Decrypt(dst, src []byte) { copy(dst, src) }
+func (crypt *noneBlockCrypt) Encrypt(dst, src []byte) { copy(dst, src) }
+func (crypt *noneBlockCrypt) Decrypt(dst, src []byte) { copy(dst, src) }
 
 // packet encryption with local CFB mode
 func encrypt(block cipher.Block, dst, src, buf []byte) {
@@ -288,71 +194,71 @@ func encrypt8(block cipher.Block, dst, src, buf []byte) {
 	base := 0
 	repeat := n / 8
 	left := n % 8
-	ptr_tbl := (*uint64)(unsafe.Pointer(&tbl[0]))
+	ptrTbl := (*uint64)(unsafe.Pointer(&tbl[0]))
 
 	for i := 0; i < repeat; i++ {
 		s := src[base:][0:64]
 		d := dst[base:][0:64]
 		// 1
-		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptrTbl
 		block.Encrypt(tbl, d[0:8])
 		// 2
-		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptrTbl
 		block.Encrypt(tbl, d[8:16])
 		// 3
-		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptrTbl
 		block.Encrypt(tbl, d[16:24])
 		// 4
-		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptrTbl
 		block.Encrypt(tbl, d[24:32])
 		// 5
-		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptrTbl
 		block.Encrypt(tbl, d[32:40])
 		// 6
-		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptrTbl
 		block.Encrypt(tbl, d[40:48])
 		// 7
-		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptrTbl
 		block.Encrypt(tbl, d[48:56])
 		// 8
-		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptrTbl
 		block.Encrypt(tbl, d[56:64])
 		base += 64
 	}
 
 	switch left {
 	case 7:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 6:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 5:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 4:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 3:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 2:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
 	case 1:
-		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&dst[base])) = *(*uint64)(unsafe.Pointer(&src[base])) ^ *ptrTbl
 		block.Encrypt(tbl, dst[base:])
 		base += 8
 		fallthrough
@@ -461,8 +367,8 @@ func decrypt8(block cipher.Block, dst, src, buf []byte) {
 	base := 0
 	repeat := n / 8
 	left := n % 8
-	ptr_tbl := (*uint64)(unsafe.Pointer(&tbl[0]))
-	ptr_next := (*uint64)(unsafe.Pointer(&next[0]))
+	ptrTbl := (*uint64)(unsafe.Pointer(&tbl[0]))
+	ptrNext := (*uint64)(unsafe.Pointer(&next[0]))
 
 	// loop unrolling to relieve data dependency
 	for i := 0; i < repeat; i++ {
@@ -470,28 +376,28 @@ func decrypt8(block cipher.Block, dst, src, buf []byte) {
 		d := dst[base:][0:64]
 		// 1
 		block.Encrypt(next, s[0:8])
-		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[0])) = *(*uint64)(unsafe.Pointer(&s[0])) ^ *ptrTbl
 		// 2
 		block.Encrypt(tbl, s[8:16])
-		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptr_next
+		*(*uint64)(unsafe.Pointer(&d[8])) = *(*uint64)(unsafe.Pointer(&s[8])) ^ *ptrNext
 		// 3
 		block.Encrypt(next, s[16:24])
-		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[16])) = *(*uint64)(unsafe.Pointer(&s[16])) ^ *ptrTbl
 		// 4
 		block.Encrypt(tbl, s[24:32])
-		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptr_next
+		*(*uint64)(unsafe.Pointer(&d[24])) = *(*uint64)(unsafe.Pointer(&s[24])) ^ *ptrNext
 		// 5
 		block.Encrypt(next, s[32:40])
-		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[32])) = *(*uint64)(unsafe.Pointer(&s[32])) ^ *ptrTbl
 		// 6
 		block.Encrypt(tbl, s[40:48])
-		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptr_next
+		*(*uint64)(unsafe.Pointer(&d[40])) = *(*uint64)(unsafe.Pointer(&s[40])) ^ *ptrNext
 		// 7
 		block.Encrypt(next, s[48:56])
-		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptr_tbl
+		*(*uint64)(unsafe.Pointer(&d[48])) = *(*uint64)(unsafe.Pointer(&s[48])) ^ *ptrTbl
 		// 8
 		block.Encrypt(tbl, s[56:64])
-		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptr_next
+		*(*uint64)(unsafe.Pointer(&d[56])) = *(*uint64)(unsafe.Pointer(&s[56])) ^ *ptrNext
 		base += 64
 	}
 

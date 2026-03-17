@@ -2,7 +2,6 @@ package shadowsocks
 
 import (
 	"fmt"
-	"github.com/chainreactors/rem/x/utils"
 	"io"
 	"net"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 	"github.com/chainreactors/rem/protocol/cio"
 	"github.com/chainreactors/rem/protocol/core"
 	"github.com/chainreactors/rem/x/socks5"
+	"github.com/chainreactors/rem/x/utils"
 	ss "github.com/shadowsocks/go-shadowsocks2/core"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
@@ -144,6 +144,9 @@ func ReadAddr(r io.Reader, b []byte) (*socks5.AddrSpec, error) {
 }
 
 func NewShadowSocksOutbound(options map[string]string, dial core.ContextDialer) (core.Outbound, error) {
+	if options == nil {
+		options = make(map[string]string)
+	}
 	pwd := options["password"]
 	var cip string
 	var ok bool
@@ -162,6 +165,9 @@ func NewShadowSocksOutbound(options map[string]string, dial core.ContextDialer) 
 
 }
 func NewShadowSocksInbound(options map[string]string) (core.Inbound, error) {
+	if options == nil {
+		options = make(map[string]string)
+	}
 	pwd := options["password"]
 	var cip string
 	var ok bool
@@ -192,6 +198,9 @@ func (plug *ShadowSocksPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn
 	tgt, err := socks.ReadAddr(ssConn)
 	if err != nil {
 		return nil, err
+	}
+	if plug.dial != nil {
+		return plug.dial.Dial("tcp", tgt.String())
 	}
 	return net.Dial("tcp", tgt.String())
 }
