@@ -181,7 +181,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -o OSARCH           指定目标平台，空格或逗号分隔 (默认: windows/amd64 windows/386 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64)"
             echo "  -a APPLICATION      指定应用模块 (如: http,socks,raw)"
             echo "  -t TRANSPORT        指定传输模块 (如: tcp,udp,websocket,simplex)"
-            echo "  --tags TAGS         指定 build tags，逗号分隔 (如: oss,graph,dns)"
+            echo "  --tags TAGS         指定 build tags，逗号分隔 (如: oss,dns)"
             echo "  -g                  只生成配置文件，不编译"
             echo "  --full              编译包含所有模块的full版本"
             echo "  -buildmode MODE     指定构建模式 (exe, tinygo, c-shared, c-archive)"

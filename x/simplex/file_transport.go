@@ -21,7 +21,7 @@ const (
 	fileDefaultMaxFailures = 10
 )
 
-// FileStorageOps abstracts cloud file storage operations (OneDrive / OSS / etc).
+// FileStorageOps abstracts cloud file storage operations (OSS / etc).
 type FileStorageOps interface {
 	ReadFile(path string) ([]byte, error)     // Read file; 404 → os.ErrNotExist
 	WriteFile(path string, data []byte) error // Create/overwrite file
@@ -38,7 +38,7 @@ type FileTransportConfig struct {
 	MaxBodySize    int
 	IdleMultiplier int    // handler idle exit multiplier; 0 = use default (fileHandlerIdleMultiplier)
 	MaxFailures    int    // consecutive failure limit; 0 = use default (fileDefaultMaxFailures)
-	LogPrefix      string // e.g. "[OneDrive]" or "[OSS-File]"
+	LogPrefix      string // e.g. "[OSS-File]"
 }
 
 func (c *FileTransportConfig) idleMultiplier() int {

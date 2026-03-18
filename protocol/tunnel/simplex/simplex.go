@@ -13,19 +13,19 @@ import (
 // isHighLatencyTransport 判断是否是高延迟传输（如轮询基础的 API）
 func isHighLatencyTransport(scheme string) bool {
 	scheme = strings.ToLower(scheme)
-	// SharePoint/OneDrive/OSS 等轮询基础传输通常 RTT > 6s
-	return scheme == "sharepoint" || scheme == "onedrive" || scheme == "teams"
+	// OSS 等轮询基础传输通常 RTT > 6s
+	return scheme == "oss"
 }
 
 func init() {
 	core.DialerRegister(core.SimplexTunnel, func(ctx context.Context) (core.TunnelDialer, error) {
 		return NewSimplexDialer(ctx), nil
 	},
-		"sharepoint", "oss", "onedrive")
+		"oss")
 	core.ListenerRegister(core.SimplexTunnel, func(ctx context.Context) (core.TunnelListener, error) {
 		return NewSimplexListener(ctx), nil
 	},
-		"sharepoint", "oss", "onedrive")
+		"oss")
 }
 
 type SimplexDialer struct {
@@ -73,7 +73,7 @@ func (d *SimplexDialer) Dial(dst string) (net.Conn, error) {
 
 	mtu := addr.MaxBodySize()
 
-	// 为高延迟传输（如 SharePoint 3s 轮询）配置更大的 RTO
+	// 为高延迟传输配置更大的 RTO
 	cfg := arq.ARQConfig{
 		MTU:     mtu,
 		Timeout: 0,
@@ -111,7 +111,7 @@ func (l *SimplexListener) Listen(dst string) (net.Listener, error) {
 	// 获取MTU配置
 	mtu := server.Addr().MaxBodySize()
 
-	// 为高延迟传输（如 SharePoint 3s 轮询）配置更大的 RTO
+	// 为高延迟传输配置更大的 RTO
 	cfg := arq.ARQConfig{
 		MTU:     mtu,
 		Timeout: 0,

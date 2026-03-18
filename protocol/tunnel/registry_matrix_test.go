@@ -35,7 +35,6 @@ func TestRegisteredTunnelDialersConstruct(t *testing.T) {
 		{rawURL: "unix+raw://127.0.0.1:0/rem?pipe=rem-test&wrapper=raw", tunnelName: core.UNIXTunnel},
 		{rawURL: "memory+socks://alice:secret@rem-pipe?wrapper=raw", tunnelName: core.MemoryTunnel},
 		{rawURL: "dns+raw://127.0.0.1:5353/rem?domain=test.local&wrapper=raw", tunnelName: core.DNSTunnel},
-		{rawURL: "simplex+sharepoint:///rem?tenant=test-tenant&client=test-client&secret=test-secret&site=test-site&wrapper=raw", tunnelName: core.SimplexTunnel},
 		{rawURL: "icmp+raw://127.0.0.1:0/rem?wrapper=raw", tunnelName: core.ICMPTunnel},
 	}
 
@@ -67,7 +66,6 @@ func TestRegisteredTunnelListenersConstruct(t *testing.T) {
 		{rawURL: "unix+raw://127.0.0.1:0/rem?pipe=rem-test&wrapper=raw", tunnelName: core.UNIXTunnel},
 		{rawURL: "memory+socks://alice:secret@rem-pipe?wrapper=raw", tunnelName: core.MemoryTunnel},
 		{rawURL: "dns+raw://127.0.0.1:5353/rem?domain=test.local&wrapper=raw", tunnelName: core.DNSTunnel},
-		{rawURL: "simplex+sharepoint:///rem?tenant=test-tenant&client=test-client&secret=test-secret&site=test-site&wrapper=raw", tunnelName: core.SimplexTunnel},
 		{rawURL: "icmp+raw://127.0.0.1:0/rem?wrapper=raw", tunnelName: core.ICMPTunnel},
 	}
 

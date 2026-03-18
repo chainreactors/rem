@@ -224,7 +224,7 @@ func (agent *Agent) Accept() (net.Conn, error) {
 }
 
 // LoginTimeout limits how long Login() / Dial() waits for the server's Ack.
-// On polling-based transports (OneDrive, SharePoint) the server may need
+// On polling-based transports the server may need
 // several poll cycles to discover the new client.  Keep this short-ish so
 // the caller's retry loop re-dials quickly with a fresh transport instance.
 var LoginTimeout = 60 * time.Second

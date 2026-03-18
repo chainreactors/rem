@@ -6,7 +6,7 @@
 //   - Very low send frequency (3s–60s, up to 600s per packet)
 //
 // These constraints arise from polling-based covert transports (e.g.
-// SharePoint, Teams, DNS) where each "packet" is an HTTP request with
+// DNS) where each "packet" is an HTTP request with
 // multi-second round-trip time and significant jitter.
 //
 // Key design decisions:

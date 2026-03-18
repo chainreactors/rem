@@ -212,7 +212,7 @@ func (c *SimplexClient) polling() {
 				recvTicker.Reset(ni)
 			}
 			// 每次 tick 排空所有可用的 packet，而不是只读一个。
-			// 对于 SharePoint 等高延迟传输，一个 SharePoint item 可能包含多个
+			// 对于高延迟传输，一个 item 可能包含多个
 			// SimplexPacket（多个 ARQ 段），需要全部交付给 ARQ 层才能组装完整帧。
 			for {
 				pkt, _, err := c.Receive()

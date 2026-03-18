@@ -34,7 +34,7 @@ func init() {
 }
 
 const (
-	DefaultOSSInterval = 2000             // 2000 milliseconds (cloud storage API, match OneDrive)
+	DefaultOSSInterval = 2000             // 2000 milliseconds (cloud storage API)
 	MaxOSSMessageSize  = 1024 * 1024      // 1MB
 	DefaultOSSTimeout  = 30 * time.Second // 30 seconds
 	SessionTimeout     = 300 * time.Second // 5 minutes session timeout (cloud storage high latency)
