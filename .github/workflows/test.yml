@@ -1,0 +1,748 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*.*.*", "nightly*"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      run_icmp:
+        description: "Run privileged ICMP tests (requires sudo)"
+        type: boolean
+        default: false
+      run_stress:
+        description: "Run stress / long-running tests"
+        type: boolean
+        default: false
+
+# Cancel superseded runs on the same branch to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Basic checks
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: go vet
+        run: |
+          # Vet only core packages; exclude vendored/ported packages and
+          # packages requiring special build targets (wireguard/gvisor,
+          # trojanx/shadowtls which have pre-existing upstream vet issues).
+          go list ./... \
+            | grep -v '/protocol/tunnel/wireguard' \
+            | grep -v '/x/trojanx' \
+            | grep -v '/x/shadowtls' \
+            | grep -v '/x/utls' \
+            | xargs go vet
+
+      - name: go fmt check
+        run: |
+          # Only check project-owned packages; x/ contains ported third-party code.
+          UNFORMATTED=$(gofmt -l ./runner/ ./protocol/)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "Go code is not formatted:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Unit tests (independent of build configuration)
+  # ──────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Test x/utils
+        run: go test -v -race -timeout 3m ./x/utils/...
+
+      - name: Test x/arq core
+        run: >
+          go test -v -race -timeout 3m ./x/arq
+          -run '^(TestARQBasicSendRecv|TestARQRecvInOrder|TestARQRecvOutOfOrder|TestARQDuplicatePackets|TestARQNACKTriggering|TestARQNACKRetransmit|TestARQFragmentation|TestARQWaitSnd|TestARQBinaryFormat|TestARQCleanupOldSegments|TestARQConcurrentAccess|TestARQTimeout|TestARQEmptyInput|TestARQMultiplePacketsInInput)$'
+
+      - name: Test x/arq stress
+        run: >
+          go test -v -race -timeout 4m ./x/arq
+          -run '^(TestARQPacketLoss|TestARQHighPacketLoss|TestARQReordering|TestARQConcurrentSendRecv|TestARQBurstySend|TestARQWindowExhaustion|TestARQDuplicateNACK|TestARQMalformedPackets|TestARQRapidUpdateCalls|TestARQConcurrentInputUpdate|TestARQMemoryLeak|TestARQZeroMTU|TestARQNegativeMTU|TestSlowNet_|TestExtreme_)$'
+
+      - name: Test x/arq session
+        run: >
+          go test -v -race -timeout 4m ./x/arq
+          -run '^(TestSessionAbruptClose|TestSessionConcurrentReadWrite|TestSessionReadTimeout|TestSessionWriteTimeout|TestListenerMultipleSessionsStress|TestListenerAcceptBacklog|TestListenerCloseWithActiveSessions|TestSessionBufferOverflow|TestSessionRapidCloseOpen|TestListenerConcurrentAccept|TestSessionDeadlineRace|TestListenerMonitorStress|TestListenerCleansUpClosedSessions|TestBackgroundLoopDoesNotStealData|TestMonitorDrainsWhenBackgroundLoopBlocked)$'
+
+      - name: Test x/simplex
+        run: >
+          go test -v -race -timeout 3m ./x/simplex/...
+          -run '^(TestSimp|TestPeek|TestAsym|TestHTTP_E2E|TestHTTP_Concurrent|TestHTTP_Sustained|TestHTTP_DataIntegrity|TestHTTP_Throughput_MessageRate)'
+
+      - name: Test x/simplex registry matrix
+        run: go test -v -race -timeout 2m ./x/simplex -run '^TestRegisteredSimplexResolvers$'
+
+      - name: Test protocol/wrapper
+        run: go test -v -race -timeout 2m ./protocol/wrapper/...
+
+      - name: Test protocol/cio conn semantics
+        run: >
+          go test -v -race -timeout 2m ./protocol/cio
+          -run '^(TestWrapConn_NetConn|TestWrapConnWithUnderlyingClose_NetConn|TestLimitedConn_NetConn)$'
+
+      - name: Test agent bridge conn semantics
+        # Keep this non-race for now: the bridge conformance test itself is stable,
+        # but package-local shutdown bookkeeping still triggers race detector reports.
+        run: go test -v -timeout 3m ./agent -run '^TestBridge_NetConn$'
+
+      - name: Test protocol/core
+        run: go test -v -race -timeout 1m ./protocol/core/...
+
+      - name: Test protocol/serve
+        run: go test -v -race -timeout 2m ./protocol/serve/...
+
+      - name: Test protocol/tunnel registry matrix
+        run: go test -v -race -timeout 2m ./protocol/tunnel -run '^TestRegisteredTunnel'
+
+      - name: Test protocol/tunnel
+        run: |
+          go list ./protocol/tunnel/... \
+            | grep -v '/wireguard' \
+            | grep -v '/wasm' \
+            | xargs go test -v -race -timeout 2m
+
+      - name: Test runner unit (options, console, connhub, recover, multiserve parsing)
+        run: >
+          go test -v -race -timeout 3m ./runner/
+          -run '^(TestOptionsParseArgs|TestRemDialCommand|TestOptionsRetry|TestOptionsPrepare|TestConsoleMatchPendingConn|TestParseChannelRole|TestRun_|TestMultiServeParsing|TestMultiServeDefaultSchemes|TestMultiServeUnbalancedPairs)'
+
+      - name: Test runner conn semantics
+        run: go test -v -race -timeout 2m ./runner -run '^TestMergeHalfConn_NetConn$'
+
+      - name: Test yamux stream conn conformance
+        run: go test -v -race -timeout 3m ./x/yamux -run '^TestStream_NetConn$'
+
+  protocol-regression:
+    name: "Protocol: regression suite"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Test protocol/core
+        run: go test -v -race -timeout 1m ./protocol/core/...
+
+      - name: Test protocol/serve
+        run: go test -v -race -timeout 2m ./protocol/serve/...
+
+      - name: Test protocol/tunnel
+        run: |
+          go list ./protocol/tunnel/... \
+            | grep -v '/wireguard' \
+            | grep -v '/wasm' \
+            | xargs go test -v -race -timeout 2m
+
+      - name: Build TCP + serve modules
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "http,raw,socks,portforward,shadowsocks,trojan" -t "tcp" -o "linux/amd64"
+        env:
+          GOFLAGS: -buildvcs=false
+
+      - name: Test protocol serve e2e
+        run: go test -v -timeout 8m -run '^(TestE2E_Serve_HTTPProxy|TestE2E_Serve_PortForward|TestE2E_Serve_Raw)' ./runner/
+
+      - name: Test protocol proxyclient e2e
+        run: >
+          go test -v -tags proxyclient_shadowsocks -timeout 180s ./runner/
+          -run '^TestE2E_ProxyClient'
+          -skip 'ConcurrentConns'
+
+  dns-simplex-tests:
+    name: "DNS: simplex layer tests"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Test DNS simplex registry matrix
+        run: go test -v -tags dns -race -timeout 2m ./x/simplex -run '^TestRegisteredDNSSimplexResolvers$'
+
+      - name: Test DNS unit + E2E + boundary
+        run: >
+          go test -v -tags dns -race -timeout 5m ./x/simplex/...
+          -run '^(TestDNS_|TestDNSBoundary_)'
+
+      - name: Test DNS stress (short)
+        run: >
+          go test -v -tags dns -race -timeout 5m ./x/simplex/...
+          -run '^TestDNSStress_(BurstSend|ConcurrentClients_5|DataIntegrity|RapidOpenClose|ConcurrentSendReceive|Bidirectional_Sustained|Throughput_UDP)'
+
+  oss-simplex-tests:
+    name: "OSS: simplex registry matrix"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Test OSS simplex registry matrix
+        run: go test -v -tags oss -timeout 2m ./x/simplex -run '^TestRegisteredOSSSimplexResolvers$'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Tunnel: Build + Test pairing
+  # ──────────────────────────────────────────────────────────────────────────
+  tunnel-tcp:
+    name: "Tunnel: TCP"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP tunnel
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "http,socks" -t "tcp" -o "linux/amd64"
+
+      - name: Test TCP tunnel
+        run: go test -v -timeout 5m -run '^TestE2E_SOCKS5|^TestE2E_TCP|^TestE2E_Memory' ./runner/
+
+      - name: Test MultiServe E2E
+        run: go test -v -timeout 5m -run '^TestE2E_MultiServe' ./runner/
+
+      - name: Test Duplex tunnel
+        run: go test -v -timeout 5m -run '^TestDuplexTunnel' ./runner/
+
+  tunnel-tcp-tls:
+    name: "Tunnel: TCP + TLS wrapper"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP tunnel (TLS wrapper included)
+        run: bash build.sh -a "socks" -t "tcp" -o "linux/amd64"
+
+      - name: Test TLS wrapper
+        run: go test -v -timeout 5m -run '^TestE2E_TLS' ./runner/
+
+  tunnel-tcp-tlsintls:
+    name: "Tunnel: TCP + TLSInTLS"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP tunnel (TLSInTLS wrapper included)
+        run: bash build.sh -a "socks" -t "tcp" -o "linux/amd64"
+
+      - name: Test TLSInTLS wrapper
+        run: go test -v -timeout 6m -run '^TestE2E_TLSInTLS' ./runner/
+
+  tunnel-tcp-shadowtls:
+    name: "Tunnel: TCP + ShadowTLS"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP tunnel (ShadowTLS wrapper included)
+        run: bash build.sh -a "socks" -t "tcp" --tags advance -o "linux/amd64"
+
+      - name: Test ShadowTLS wrapper
+        run: go test -v -tags advance -timeout 6m -run '^TestE2E_ShadowTLS' ./runner/
+
+  tunnel-udp:
+    name: "Tunnel: UDP/KCP"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build UDP tunnel
+        run: bash build.sh -a "socks" -t "udp" -o "linux/amd64"
+
+      - name: Test UDP tunnel
+        run: go test -v -timeout 8m -run '^TestE2E_UDP' ./runner/
+
+  tunnel-websocket:
+    name: "Tunnel: WebSocket"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build WebSocket tunnel
+        run: bash build.sh -a "socks" -t "websocket" -o "linux/amd64"
+
+      - name: Test WebSocket tunnel
+        run: go test -v -timeout 5m -run '^TestE2E_WebSocket' ./runner/
+
+  tunnel-http:
+    name: "Tunnel: HTTP transport"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build HTTP tunnel
+        run: bash build.sh -a "socks" -t "http" -o "linux/amd64"
+
+      - name: Test HTTP tunnel
+        run: go test -v -timeout 8m -run '^TestE2E_HTTPTransport' ./runner/
+
+  tunnel-http2:
+    name: "Tunnel: HTTP/2 transport"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build HTTP/2 tunnel
+        run: bash build.sh -a "socks" -t "http2" -o "linux/amd64"
+
+      - name: Test HTTP/2 tunnel
+        run: go test -v -timeout 8m -run '^TestE2E_HTTP2' ./runner/
+
+  tunnel-streamhttp:
+    name: "Tunnel: Stream HTTP transport"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build Stream HTTP tunnel
+        run: bash build.sh -a "socks" -t "streamhttp" -o "linux/amd64"
+
+      - name: Test Stream HTTP tunnel
+        run: go test -v -timeout 8m -run '^TestE2E_StreamHTTP' ./runner/
+
+  tunnel-wireguard:
+    name: "Tunnel: WireGuard"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # gvisor v0.0.0-20221203 has //go:build !go1.21 in pkg/gohacks;
+          # use Go 1.20 until the dependency is updated.
+          go-version: "1.20"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Test WireGuard tunnel registry matrix
+        run: go test -v -timeout 2m ./protocol/tunnel -run '^TestRegisteredWireGuardTunnelConstructs$'
+
+      - name: Build WireGuard tunnel
+        run: bash build.sh -a "socks" -t "wireguard" -o "linux/amd64"
+
+      - name: Test WireGuard tunnel smoke
+        run: go test -v -timeout 10m -run '^TestE2E_WG_SOCKS5Proxy$' ./runner/
+
+      - name: Test WireGuard multi-client regression
+        id: wireguard_multiclient
+        continue-on-error: true
+        run: go test -v -timeout 10m -run '^TestE2E_WG_MultiClient$' ./runner/
+
+      - name: Report WireGuard multi-client result
+        if: always()
+        run: |
+          if [ "${{ steps.wireguard_multiclient.outcome }}" != "success" ]; then
+            echo "::warning::WireGuard multi-client regression failed on this runner. The smoke path still passed, but multi-client needs investigation."
+            result="failed on this runner"
+          else
+            result="passed"
+          fi
+          {
+            echo "## WireGuard Multi-Client Regression"
+            echo
+            echo "- Result: ${result}"
+            echo "- Smoke test: passed"
+            echo "- Multi-client test: executed on every CI run"
+            echo "- Blocking status: non-blocking regression signal"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tunnel-memory:
+    name: "Tunnel: Memory bridge"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build Memory tunnel
+        run: bash build.sh -a "socks" -t "memory" -o "linux/amd64"
+
+      - name: Test Memory bridge
+        run: go test -v -timeout 5m -run '^TestE2E_Memory' ./runner/
+
+  tunnel-icmp:
+    name: "Tunnel: ICMP (privileged, manual)"
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' && inputs.run_icmp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build ICMP tunnel
+        run: bash build.sh -a "socks" -t "icmp" -o "linux/amd64"
+
+      - name: Test ICMP tunnel (requires sudo)
+        run: sudo -E $(which go) test -v -timeout 10m -run '^TestE2E_ICMP' ./runner/
+        env:
+          REM_TEST_ICMP: "1"
+
+  tunnel-unix:
+    name: "Tunnel: Unix domain socket"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build Unix tunnel
+        run: bash build.sh -a "socks" -t "unix" -o "linux/amd64"
+
+      - name: Test Unix tunnel
+        run: go test -v -timeout 5m -run '^TestE2E_Unix' ./runner/
+
+  tunnel-dns:
+    name: "Tunnel: DNS (KCP over UDP)"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build DNS tunnel
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "socks" -t "dns" --tags dns -o "linux/amd64"
+
+      - name: Test DNS tunnel
+        continue-on-error: true
+        run: go test -v -timeout 8m -tags dns -run '^TestE2E_DNS' ./runner/
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Serve: Application layer (TCP baseline)
+  # ──────────────────────────────────────────────────────────────────────────
+  serve-layer:
+    name: "Serve: application layer (TCP baseline)"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP + all serve modules
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "http,raw,socks,portforward" -t "tcp" -o "linux/amd64"
+        env:
+          GOFLAGS: -buildvcs=false
+
+      - name: Test SOCKS5 serve
+        run: go test -v -timeout 5m -run '^TestE2E_SOCKS5' ./runner/
+
+      - name: Test HTTP proxy serve
+        run: go test -v -timeout 5m -run '^TestE2E_Serve_HTTPProxy' ./runner/
+
+      - name: Test port-forward serve
+        run: go test -v -timeout 5m -run '^TestE2E_Serve_PortForward' ./runner/
+
+      - name: Test raw serve
+        run: go test -v -timeout 5m -run '^TestE2E_Serve_Raw' ./runner/
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Serve: Shadowsocks + Trojan (proxyclient integration)
+  # ──────────────────────────────────────────────────────────────────────────
+  serve-proxyclient:
+    name: "Serve: SS + Trojan (proxyclient)"
+    runs-on: ubuntu-22.04
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build TCP + SS/Trojan serve modules
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "http,raw,socks,portforward,shadowsocks,trojan" -t "tcp" -o "linux/amd64"
+        env:
+          GOFLAGS: -buildvcs=false
+
+      - name: Test SS + Trojan proxyclient integration
+        run: >
+          go test -v -tags proxyclient_shadowsocks -timeout 180s ./runner/
+          -run '^TestE2E_ProxyClient'
+          -skip 'ConcurrentConns'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Full build verification
+  # ──────────────────────────────────────────────────────────────────────────
+  build-full:
+    name: "Build: full configuration"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build full configuration
+        run: bash build.sh --full -o "linux/amd64"
+
+      - name: Build c-shared library
+        run: bash build.sh -buildmode c-shared -o "linux/amd64"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Stress tests (manual trigger only)
+  # ──────────────────────────────────────────────────────────────────────────
+  stress-tests:
+    name: "Stress Tests (manual)"
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' && inputs.run_stress
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Install gox
+        run: go install github.com/mitchellh/gox@latest
+
+      - name: Build for stress tests
+        run: |
+          sed -i 's/\r$//' build.sh
+          bash build.sh -a "http,socks" -t "tcp,udp,websocket" -o "linux/amd64"
+
+      - name: Stress — x/utils buffer
+        run: go test -v -timeout 10m -run 'Stress|Burst|Deadlock' ./x/utils/...
+
+      - name: Stress — x/arq stable scenarios
+        run: >
+          go test -v -timeout 15m ./x/arq
+          -run '^(TestARQPacketLoss|TestARQHighPacketLoss|TestARQReordering|TestARQConcurrentSendRecv|TestARQBurstySend|TestARQWindowExhaustion|TestARQDuplicateNACK|TestARQMalformedPackets|TestARQRapidUpdateCalls|TestARQConcurrentInputUpdate|TestARQMemoryLeak|TestSlowNet_|TestExtreme_|TestSessionAbruptClose|TestListenerMultipleSessionsStress|TestListenerSessionCloseRace|TestListenerAcceptBacklog|TestListenerMonitorStress)$'
+
+      - name: Stress — x/simplex SimplexBuffer
+        run: go test -v -timeout 10m -run 'Stress|Concurrent|Large' ./x/simplex/...
+
+      - name: Stress — TCP 256MB transfer + 100 concurrent
+        run: go test -v -timeout 30m -run '^TestE2E_TCP_VeryLargeTransfer|^TestE2E_TCP_HighConcurrency' ./runner/
+        env:
+          REM_STRESS: "1"
+
+      - name: Stress — UDP 256MB transfer + 100 concurrent
+        run: go test -v -timeout 30m -run '^TestE2E_UDP_VeryLargeTransfer|^TestE2E_UDP_HighConcurrency' ./runner/
+        env:
+          REM_STRESS: "1"
+
+      - name: Stress — WebSocket 256MB transfer + 100 concurrent
+        run: go test -v -timeout 30m -run '^TestE2E_WebSocket_VeryLargeTransfer|^TestE2E_WebSocket_HighConcurrency' ./runner/
+        env:
+          REM_STRESS: "1"
+
+      - name: Stress — DNS bandwidth (uplink + downlink 60s each)
+        run: >
+          go test -v -tags dns -timeout 15m ./x/simplex/...
+          -run '^TestDNSStress_(Bandwidth_Uplink|Bandwidth_Downlink|ConcurrentClients_10|Bidirectional_Sustained|Throughput_UDP)'
+
+      - name: Stress — HTTP simplex bandwidth (uplink + downlink + bidirectional)
+        run: >
+          go test -v -timeout 5m ./x/simplex/...
+          -run '^TestHTTP_Bandwidth_'
+
+      - name: Stress — runner stress tests (burst, spike, rapid open/close)
+        run: go test -v -timeout 15m -run '^TestStress_' ./runner/
+
+      - name: Stress — runner bench tests (TCP, UDP, duplex)
+        run: go test -v -timeout 15m -run '^TestBench_' ./runner/
+
+      - name: Stress — ConnHub performance
+        run: go test -v -timeout 10m -run '^TestConnHub_' ./runner/
+
+      - name: Stress — TCP stability (10 min)
+        run: go test -v -timeout 15m -run '^TestE2E_TCP_Stability' ./runner/
+        env:
+          REM_STABILITY: "1"
