@@ -26,7 +26,7 @@ BUILDMODE=""
 DISABLE_ARCH_FLAGS=false
 BUILD_TAGS=""
 # 设置默认值
-DEFAULT_APPLICATION="http,raw,socks,portforward"
+DEFAULT_APPLICATION="http,raw,socks,portforward,shadowsocks,trojan"
 DEFAULT_TRANSPORT="tcp,udp,icmp"
 DEFAULT_OSARCH="windows/amd64 windows/386 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"
 

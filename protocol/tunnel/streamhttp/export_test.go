@@ -57,11 +57,11 @@ func (e *ReplayBufferExported) Close() {
 	e.rb.Close()
 }
 
-// DisableHTTP2Listener patches the listener's HTTP server to disable HTTP/2.
-// Must be called after Listen() and before any connections arrive.
+// DisableHTTP2Listener configures the listener to disable HTTP/2.
+// It must be called before Listen() starts the HTTP server.
 func DisableHTTP2Listener(l *StreamHTTPListener) {
-	if l.server != nil {
-		l.server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	if l != nil {
+		l.disableH2 = true
 	}
 }
 

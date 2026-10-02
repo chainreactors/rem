@@ -24,9 +24,12 @@ import (
 	"github.com/chainreactors/rem/x/utils"
 )
 
-const (
-	minCloseFlushTimeout = 200 * time.Millisecond
-)
+const readBufferDeliverChunk = 64 * 1024
+
+// sessionTickInterval controls the ARQ state-machine tick (flush, RTO check)
+// and doubles as the polling timeout for conn reads and close drain.
+// Kept as a var so extreme-scenario tests can override it.
+var sessionTickInterval = 10 * time.Millisecond
 
 // timeoutError 实现net.Error接口
 type timeoutError struct{}
@@ -43,9 +46,9 @@ type ARQSession struct {
 	readBuffer *utils.Buffer  // 读缓冲区
 
 	// 配置参数
-	defaultTimeout    time.Duration // 默认超时时间
-	closeDrainTimeout time.Duration
-	readFromConn      bool // true=独占conn自行读取, false=由listener的monitor分发数据
+	closeDrainTimeout    time.Duration
+	closeAckFlushTimeout time.Duration
+	readFromConn         bool // true=独占conn自行读取, false=由listener的monitor分发数据
 
 	// 生命周期回调
 	onClose func() // Close()时调用，用于通知listener清理
@@ -54,6 +57,8 @@ type ARQSession struct {
 	closed     int32 // 0=open, 1=closing/closed for user-facing ops
 	finalized  int32 // 0=background loops running, 1=transport fully closed
 	localClose int32 // 1=Close() initiated locally; post-close I/O returns EOF/ErrClosedPipe
+	localWrote int32 // 1=application has written stream data
+	remoteDone int32 // 1=peer FIN has been delivered in-order
 	rdNano     int64 // 读超时纳秒时间戳
 	wdNano     int64 // 写超时纳秒时间戳
 	closeErr   atomic.Value
@@ -62,8 +67,6 @@ type ARQSession struct {
 
 	// dataReady signals Read() that new data was written to readBuffer
 	dataReady chan struct{}
-	// pushReady signals ReadPush() that new push data arrived
-	pushReady chan struct{}
 	// inputNotify signals backgroundLoop (listener mode) that arq.Input() was called
 	inputNotify chan struct{}
 	// done is closed when the session closes, waking all blocked operations
@@ -73,10 +76,9 @@ type ARQSession struct {
 }
 
 // NewARQSession 创建基于PacketConn的ARQ会话（独占模式，自行从conn读取数据）
-func NewARQSession(conn net.PacketConn, remoteAddr net.Addr, mtu int, timeout time.Duration) *ARQSession {
+func NewARQSession(conn net.PacketConn, remoteAddr net.Addr, mtu int, _ time.Duration) *ARQSession {
 	return NewARQSessionWithConfig(conn, remoteAddr, ARQConfig{
-		MTU:     mtu,
-		Timeout: int(timeout.Milliseconds()),
+		MTU: mtu,
 	})
 }
 
@@ -86,10 +88,9 @@ func NewARQSessionWithConfig(conn net.PacketConn, remoteAddr net.Addr, cfg ARQCo
 }
 
 // newARQSession 内部构造函数（兼容旧调用）
-func newARQSession(conn net.PacketConn, remoteAddr net.Addr, mtu int, timeout time.Duration, readFromConn bool) *ARQSession {
+func newARQSession(conn net.PacketConn, remoteAddr net.Addr, mtu int, _ time.Duration, readFromConn bool) *ARQSession {
 	return newARQSessionWithConfig(conn, remoteAddr, ARQConfig{
-		MTU:     mtu,
-		Timeout: int(timeout.Milliseconds()),
+		MTU: mtu,
 	}, readFromConn)
 }
 
@@ -118,21 +119,20 @@ func newARQSessionWithConfig(conn net.PacketConn, remoteAddr net.Addr, cfg ARQCo
 	}
 
 	sess := &ARQSession{
-		conn:              conn,
-		remoteAddr:        remoteAddr,
-		readBuffer:        utils.NewBuffer(readBufSize),
-		defaultTimeout:    time.Duration(cfg.Timeout) * time.Millisecond,
-		closeDrainTimeout: closeDrainTimeoutForConfig(cfg),
-		readFromConn:      readFromConn,
-		dataReady:         make(chan struct{}, 1),
-		pushReady:         make(chan struct{}, 1),
-		inputNotify:       make(chan struct{}, 1),
-		done:              make(chan struct{}),
-		finalDone:         make(chan struct{}),
+		conn:                 conn,
+		remoteAddr:           remoteAddr,
+		readBuffer:           utils.NewBuffer(readBufSize),
+		closeDrainTimeout:    closeDrainTimeoutForConfig(cfg),
+		closeAckFlushTimeout: closeAckFlushTimeoutForConfig(cfg, remoteAddr),
+		readFromConn:         readFromConn,
+		dataReady:            make(chan struct{}, 1),
+		inputNotify:          make(chan struct{}, 1),
+		done:                 make(chan struct{}),
+		finalDone:            make(chan struct{}),
 	}
 
 	// 创建ARQ协议实例
-	sess.arq = NewARQWithConfig(1, func(data []byte) {
+	sess.arq = NewARQWithConfig(func(data []byte) {
 		if _, err := sess.conn.WriteTo(data, sess.remoteAddr); err != nil {
 			sess.setWriteErr(err)
 		}
@@ -147,33 +147,35 @@ func newARQSessionWithConfig(conn net.PacketConn, remoteAddr net.Addr, cfg ARQCo
 
 var ErrCloseDrainTimeout = errors.New("arq session close drain timeout")
 
-func deliveryBudgetForConfig(cfg ARQConfig) time.Duration {
-	if cfg.RTO <= 0 {
-		cfg.RTO = ARQ_RTO
-	}
-	if cfg.MaxRetransmissions <= 0 {
-		cfg.MaxRetransmissions = ARQ_MAX_RETRANS
-	}
-	return time.Duration(cfg.MaxRetransmissions+1) * time.Duration(cfg.RTO) * time.Millisecond
-}
-
-func closeFlushTimeoutForRTO(rto time.Duration) time.Duration {
-	if rto <= 0 {
-		rto = minCloseFlushTimeout
-	}
-	if rto < minCloseFlushTimeout {
-		rto = minCloseFlushTimeout
-	}
-	return rto
-}
-
 func closeDrainTimeoutForConfig(cfg ARQConfig) time.Duration {
-	flushBudget := closeFlushTimeoutForRTO(time.Duration(cfg.RTO) * time.Millisecond)
-	deliveryBudget := deliveryBudgetForConfig(cfg)
-	if deliveryBudget > 0 && flushBudget > deliveryBudget {
-		return deliveryBudget
+	rto := time.Duration(cfg.RTO) * time.Millisecond
+	if rto <= 0 {
+		rto = time.Duration(ARQ_RTO) * time.Millisecond
 	}
-	return flushBudget
+	retrans := cfg.MaxRetransmissions
+	if retrans <= 0 {
+		retrans = ARQ_MAX_RETRANS
+	}
+	return time.Duration(retrans+1) * rto
+}
+
+func closeAckFlushTimeoutForConfig(cfg ARQConfig, remoteAddr net.Addr) time.Duration {
+	rto := time.Duration(cfg.RTO) * time.Millisecond
+	if rto <= 0 {
+		rto = time.Duration(ARQ_RTO) * time.Millisecond
+	}
+	timeout := rto
+	if addr, ok := remoteAddr.(interface{ Interval() time.Duration }); ok {
+		if interval := addr.Interval(); interval > 0 {
+			if t := 10 * interval; t > timeout {
+				timeout = t
+			}
+		}
+	}
+	if drain := closeDrainTimeoutForConfig(cfg); timeout > drain {
+		timeout = drain
+	}
+	return timeout
 }
 
 // Read 实现net.Conn接口
@@ -189,6 +191,9 @@ func (s *ARQSession) Read(b []byte) (n int, err error) {
 			if err := s.sessionErr(); err != nil {
 				return 0, err
 			}
+			return 0, io.EOF
+		}
+		if atomic.LoadInt32(&s.remoteDone) != 0 {
 			return 0, io.EOF
 		}
 
@@ -253,82 +258,10 @@ func (s *ARQSession) Write(b []byte) (n int, err error) {
 		s.abort(err)
 		return 0, err
 	}
-	return len(b), nil
-}
-
-// WritePush 通过 CMD_PUSH 旁路信道发送优先数据。
-// 不经过 snd_queue，不受 backpressure 阻塞，捎带 ACK。
-// 不可靠（无重传），适用于 keepalive ping/pong。
-func (s *ARQSession) WritePush(b []byte) (n int, err error) {
-	if atomic.LoadInt32(&s.closed) != 0 {
-		if err := s.sessionErr(); err != nil {
-			return 0, err
-		}
-		return 0, io.ErrClosedPipe
-	}
-	if err := s.arq.Err(); err != nil {
-		s.abort(err)
-		return 0, err
-	}
-	if err := s.writeFailure(); err != nil {
-		s.abort(err)
-		return 0, err
-	}
-	if err := s.arq.QueuePush(b); err != nil {
-		s.abort(err)
-		return 0, err
+	if len(b) > 0 {
+		atomic.StoreInt32(&s.localWrote, 1)
 	}
 	return len(b), nil
-}
-
-// ReadPush 读取旁路信道收到的 CMD_PUSH 数据。
-// 无数据时阻塞等待，直到有数据、超时或 session 关闭。
-func (s *ARQSession) ReadPush(b []byte) (n int, err error) {
-	for {
-		if data := s.arq.RecvPush(); data != nil {
-			n = copy(b, data)
-			return n, nil
-		}
-
-		if atomic.LoadInt32(&s.closed) != 0 {
-			if err := s.sessionErr(); err != nil {
-				return 0, err
-			}
-			return 0, io.EOF
-		}
-		if d := atomic.LoadInt64(&s.rdNano); d > 0 && time.Now().UnixNano() > d {
-			return 0, &timeoutError{}
-		}
-
-		// 等待 push 数据到达
-		d := atomic.LoadInt64(&s.rdNano)
-		if d > 0 {
-			remaining := time.Duration(d - time.Now().UnixNano())
-			if remaining <= 0 {
-				return 0, &timeoutError{}
-			}
-			timer := time.NewTimer(remaining)
-			select {
-			case <-s.pushReady:
-				timer.Stop()
-			case <-timer.C:
-			case <-s.done:
-			}
-		} else {
-			select {
-			case <-s.pushReady:
-			case <-s.done:
-			}
-		}
-	}
-}
-
-// signalPushReady sends a non-blocking signal to wake ReadPush()
-func (s *ARQSession) signalPushReady() {
-	select {
-	case s.pushReady <- struct{}{}:
-	default:
-	}
 }
 
 // Close stops new writes immediately, then waits a bounded amount of time for a
@@ -341,15 +274,29 @@ func (s *ARQSession) signalPushReady() {
 //   - once Close() returns, subsequent Read/Write behave like a normal closed conn
 //     (EOF / io.ErrClosedPipe) rather than surfacing close-drain bookkeeping errors
 func (s *ARQSession) Close() error {
-	s.arq.FlushPending()
-	if s.beginClose(nil) {
+	if !s.beginClose(nil) {
 		if s.arq.WaitSnd() == 0 {
-			s.finalClose()
-			return s.closeResult()
+			return nil
 		}
-		go s.drainPendingWrites()
+		return s.waitClose(s.closeDrainTimeout, true)
 	}
-	return s.waitForFinalClose(s.closeDrainTimeout)
+
+	s.syncRemoteDone()
+	queuedFIN, err := s.arq.queueFINIfNeeded(atomic.LoadInt32(&s.localWrote) != 0)
+	if err != nil {
+		s.setCloseResult(err)
+		s.finalClose()
+		return s.closeResult()
+	}
+	if s.arq.WaitSnd() == 0 {
+		if !queuedFIN && atomic.LoadInt32(&s.remoteDone) != 0 {
+			return s.waitClose(s.closeAckFlushTimeout, false)
+		}
+		s.finalClose()
+		return s.closeResult()
+	}
+	go s.drainPendingWrites()
+	return s.waitClose(s.closeDrainTimeout, true)
 }
 
 func (s *ARQSession) abort(err error) error {
@@ -369,6 +316,10 @@ func (s *ARQSession) LocalAddr() net.Addr {
 // RemoteAddr 返回远程地址
 func (s *ARQSession) RemoteAddr() net.Addr {
 	return s.remoteAddr
+}
+
+func (s *ARQSession) Stats() ARQStats {
+	return s.arq.Stats()
 }
 
 // SetDeadline 设置读写超时
@@ -420,6 +371,17 @@ func (s *ARQSession) signalDataReady() {
 	}
 }
 
+func (s *ARQSession) syncRemoteDone() bool {
+	if !s.arq.remoteDone() {
+		return false
+	}
+	if atomic.CompareAndSwapInt32(&s.remoteDone, 0, 1) {
+		s.signalDataReady()
+		return true
+	}
+	return false
+}
+
 // NotifyInput wakes the backgroundLoop (listener mode) after arq.Input() is called.
 // Called by the listener's packetInput to replace polling with event-driven delivery.
 func (s *ARQSession) NotifyInput() {
@@ -431,7 +393,7 @@ func (s *ARQSession) NotifyInput() {
 
 // updateLoop 独立运行ARQ状态机(flush/失败检测)，不受readBuffer阻塞影响
 func (s *ARQSession) updateLoop() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(sessionTickInterval)
 	defer ticker.Stop()
 
 	for {
@@ -475,15 +437,12 @@ func (s *ARQSession) backgroundLoop() {
 			// 由listener管理：等待Input通知后检查ARQ是否有待交付数据
 			delivered := false
 			if data := s.arq.Recv(); len(data) > 0 {
-				if _, err := s.readBuffer.Write(data); err != nil {
+				if err := s.deliverData(data); err != nil {
 					return
 				}
-				s.signalDataReady()
 				delivered = true
 			}
-			// 检查旁路信道 push 数据
-			if s.arq.HasPush() {
-				s.signalPushReady()
+			if s.syncRemoteDone() {
 				delivered = true
 			}
 			if !delivered {
@@ -497,7 +456,7 @@ func (s *ARQSession) backgroundLoop() {
 		}
 
 		// 独占模式：自行从conn读取数据
-		s.conn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+		s.conn.SetReadDeadline(time.Now().Add(sessionTickInterval))
 		n, addr, err := s.conn.ReadFrom(buf)
 		if err == nil && n > 0 && addr.String() == s.remoteAddr.String() {
 			s.arq.Input(buf[:n])
@@ -515,16 +474,43 @@ func (s *ARQSession) backgroundLoop() {
 
 		// 交付接收到的数据
 		if data := s.arq.Recv(); len(data) > 0 {
-			if _, err := s.readBuffer.Write(data); err != nil {
+			if err := s.deliverData(data); err != nil {
 				return
 			}
-			s.signalDataReady()
 		}
-		// 交付旁路信道 push 数据
-		if s.arq.HasPush() {
-			s.signalPushReady()
-		}
+		// Publish EOF only after any data made deliverable by the same Input()
+		// has been copied into readBuffer. FIN can arrive out of transport order
+		// and be released together with the final missing DATA segment.
+		s.syncRemoteDone()
 	}
+}
+
+func (s *ARQSession) deliverData(data []byte) error {
+	for len(data) > 0 {
+		n := readBufferDeliverChunk
+		if n > len(data) {
+			n = len(data)
+		}
+		if capacity := s.readBuffer.Cap(); capacity > 0 {
+			avail := capacity - s.readBuffer.Size()
+			if avail <= 0 {
+				s.signalDataReady()
+				avail = capacity
+			}
+			if n > avail {
+				n = avail
+			}
+		}
+		if n <= 0 {
+			n = 1
+		}
+		if _, err := s.readBuffer.Write(data[:n]); err != nil {
+			return err
+		}
+		s.signalDataReady()
+		data = data[n:]
+	}
+	return nil
 }
 
 func (s *ARQSession) sessionErr() error {
@@ -578,7 +564,6 @@ func (s *ARQSession) beginClose(err error) bool {
 	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		close(s.done) // wake all blocked Read/Write immediately
 		s.signalDataReady()
-		s.signalPushReady()
 		return true
 	}
 	return false
@@ -589,7 +574,6 @@ func (s *ARQSession) finalClose() {
 		close(s.finalDone)
 		s.readBuffer.Close()
 		s.signalDataReady()
-		s.signalPushReady()
 		if s.onClose != nil {
 			s.onClose()
 		}
@@ -601,19 +585,29 @@ func (s *ARQSession) finalClose() {
 
 func (s *ARQSession) handleSessionFailure(err error) {
 	if atomic.LoadInt32(&s.localClose) != 0 {
-		s.setCloseResult(err)
+		if err != nil && s.arq.WaitSnd() != 0 {
+			s.setCloseResult(err)
+		}
 		s.finalClose()
 		return
 	}
 	s.abort(err)
 }
 
-func (s *ARQSession) waitForFinalClose(timeout time.Duration) error {
+// waitClose waits up to timeout for the session to finalize. If
+// reportTimeout is true, ErrCloseDrainTimeout is recorded on expiry
+// (used for the drain path); otherwise the timer just triggers finalClose
+// (used for the ack-flush path where timeout is expected, not an error).
+func (s *ARQSession) waitClose(timeout time.Duration, reportTimeout bool) error {
 	if atomic.LoadInt32(&s.finalized) != 0 {
 		return s.closeResult()
 	}
 	if timeout <= 0 {
-		<-s.finalDone
+		if reportTimeout {
+			<-s.finalDone
+			return s.closeResult()
+		}
+		s.finalClose()
 		return s.closeResult()
 	}
 
@@ -624,14 +618,16 @@ func (s *ARQSession) waitForFinalClose(timeout time.Duration) error {
 	case <-s.finalDone:
 		return s.closeResult()
 	case <-timer.C:
-		s.setCloseResult(ErrCloseDrainTimeout)
+		if reportTimeout {
+			s.setCloseResult(ErrCloseDrainTimeout)
+		}
 		s.finalClose()
 		return s.closeResult()
 	}
 }
 
 func (s *ARQSession) drainPendingWrites() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(sessionTickInterval)
 	defer ticker.Stop()
 
 	for {

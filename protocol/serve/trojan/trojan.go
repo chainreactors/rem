@@ -37,7 +37,7 @@ func NewTrojanOutbound(options map[string]string, dial core.ContextDialer) (core
 	)
 	base := core.NewPluginOption(options, core.OutboundPlugin, core.TrojanServe)
 	utils.Log.Importantf("[agent.outbound] trojan serving: %s, %s", base.String(), base.URL())
-	return &TrojanPlugin{Server: server, PluginOption: base}, nil
+	return newTrojanPlugin(server, base), nil
 }
 
 func NewTrojanInbound(options map[string]string) (core.Inbound, error) {
@@ -55,34 +55,37 @@ func NewTrojanInbound(options map[string]string) (core.Inbound, error) {
 	)
 	base := core.NewPluginOption(options, core.InboundPlugin, core.TrojanServe)
 	utils.Log.Importantf("[agent.inbound] trojan serving: %s , %s", base.String(), base.URL())
-	return &TrojanPlugin{Server: server, PluginOption: base}, nil
+	return newTrojanPlugin(server, base), nil
 }
 
 type TrojanPlugin struct {
-	Server *trojanx.Server
+	Server      *trojanx.Server
+	certificate tls.Certificate
 	*core.PluginOption
 }
 
-func (plug *TrojanPlugin) genSelfSign() []tls.Certificate {
-	cert := xtls.NewRandomTLSKeyPair()
-	return []tls.Certificate{*cert}
+func newTrojanPlugin(server *trojanx.Server, base *core.PluginOption) *TrojanPlugin {
+	return &TrojanPlugin{
+		Server:       server,
+		certificate:  *xtls.NewRandomTLSKeyPair(),
+		PluginOption: base,
+	}
+}
+
+func (plug *TrojanPlugin) serverTLSConfig() *tls.Config {
+	return &tls.Config{Certificates: []tls.Certificate{plug.certificate}}
 }
 
 func (plug *TrojanPlugin) Handle(conn io.ReadWriteCloser, realConn net.Conn) (net.Conn, error) {
 	defer conn.Close()
 	wrapConn := cio.WrapConn(realConn, conn)
-	server := tls.Server(wrapConn, &tls.Config{
-		Certificates: plug.genSelfSign(),
-	})
+	server := tls.Server(wrapConn, plug.serverTLSConfig())
 	plug.Server.ServeConn(server)
 	return nil, nil
 }
 
 func (plug *TrojanPlugin) Relay(conn net.Conn, bridge io.ReadWriteCloser) (net.Conn, error) {
-	cert := xtls.NewRandomTLSKeyPair()
-	tlsConn := tls.Server(conn, &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-	})
+	tlsConn := tls.Server(conn, plug.serverTLSConfig())
 	req, err := plug.Server.ParseRequest(tlsConn)
 	if err != nil {
 		return nil, err

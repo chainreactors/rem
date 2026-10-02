@@ -413,6 +413,14 @@ type FaultController interface {
 	SetPartition(active bool)
 }
 
+// AsymFaultController extends FaultController with per-direction loss control.
+// c1→c2 is the "A to B" direction; c2→c1 is the "B to A" direction.
+type AsymFaultController interface {
+	FaultController
+	SetDropRateAtoB(percent int)
+	SetDropRateBtoA(percent int)
+}
+
 // MakeFaultyPipe creates a conn pair with fault injection support.
 type MakeFaultyPipe func(t *testing.T) (c1, c2 net.Conn, faults FaultController, stop func(), err error)
 

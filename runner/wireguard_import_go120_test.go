@@ -1,4 +1,4 @@
-//go:build !tinygo && !go1.21
+//go:build !tinygo
 
 package runner
 

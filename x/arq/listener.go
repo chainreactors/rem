@@ -17,6 +17,8 @@ const (
 	acceptBacklog = 128
 )
 
+var listenerReadPollInterval = 10 * time.Millisecond
+
 // ARQListener 类似KCP Listener，管理多个ARQSession
 type ARQListener struct {
 	conn        net.PacketConn         // 底层PacketConn
@@ -36,18 +38,16 @@ type ARQListener struct {
 }
 
 // ServeConn 将PacketConn包装为ARQListener，类似KCP的ServeConn
-func ServeConn(conn net.PacketConn, mtu int, timeout time.Duration) (*ARQListener, error) {
+func ServeConn(conn net.PacketConn, mtu int, _ time.Duration) (*ARQListener, error) {
 	return ServeConnWithConfig(conn, ARQConfig{
-		MTU:     mtu,
-		Timeout: int(timeout.Milliseconds()),
+		MTU: mtu,
 	}, false)
 }
 
 // ServeConnWithOwnership 创建ARQListener并拥有conn的所有权
-func ServeConnWithOwnership(conn net.PacketConn, mtu int, timeout time.Duration) (*ARQListener, error) {
+func ServeConnWithOwnership(conn net.PacketConn, mtu int, _ time.Duration) (*ARQListener, error) {
 	return ServeConnWithConfig(conn, ARQConfig{
-		MTU:     mtu,
-		Timeout: int(timeout.Milliseconds()),
+		MTU: mtu,
 	}, true)
 }
 
@@ -88,7 +88,8 @@ func (l *ARQListener) monitor() {
 			delete(l.sessions, addr.String())
 			l.sessionLock.Unlock()
 		default:
-			// 设置短超时以避免阻塞
+			// 设置短超时以避免长期阻塞，定期处理 chClosed/die。
+			_ = l.conn.SetReadDeadline(time.Now().Add(listenerReadPollInterval))
 			n, addr, err := l.conn.ReadFrom(buf)
 			if err != nil {
 				// 超时错误是正常的，其他错误需要处理
@@ -105,8 +106,6 @@ func (l *ARQListener) monitor() {
 
 			if n > 0 {
 				l.packetInput(buf[:n], addr)
-			} else {
-				time.Sleep(time.Millisecond)
 			}
 		}
 	}
@@ -217,7 +216,7 @@ func (l *ARQListener) Close() error {
 		// 关闭所有会话
 		l.sessionLock.Lock()
 		for _, session := range l.sessions {
-			session.Close()
+			session.abort(net.ErrClosed)
 		}
 		l.sessions = make(map[string]*ARQSession)
 		l.sessionLock.Unlock()

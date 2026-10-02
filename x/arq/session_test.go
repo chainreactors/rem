@@ -15,7 +15,7 @@ import (
 )
 
 // Shared helpers are in testutil_test.go:
-// mockAddr, mockPacketConn, controlledPacketConn, makeARQDataPacket, acceptWithTimeout
+// mockAddr, mockPacketConn, makeARQDataPacket, acceptWithTimeout
 
 // ========================== Regression Tests ==========================
 // These tests assert CORRECT behavior. They should FAIL with the current
@@ -148,41 +148,34 @@ func TestSessionFailsWhenRetransmissionBudgetExceeded(t *testing.T) {
 	}
 }
 
-func TestSessionWriteBackpressureTimeout(t *testing.T) {
+func TestSessionWriteQueuesWithoutTransportCreditBackpressure(t *testing.T) {
 	const mtu = 32
-	conn := newControlledPacketConn(mtu - ARQ_OVERHEAD)
-	conn.blocked.Store(1)
-	addr := &mockAddr{"client-backpressure-timeout"}
+	conn := newMockPacketConn()
+	addr := &mockAddr{"client-no-backpressure"}
 	sess := NewARQSessionWithConfig(conn, addr, ARQConfig{
 		MTU:                mtu,
 		RTO:                50,
 		MaxRetransmissions: 2,
 	})
 	defer sess.Close()
-
-	sess.SetWriteDeadline(time.Now().Add(120 * time.Millisecond))
 
 	start := time.Now()
 	n, err := sess.Write([]byte("abcdefghijklmnopqrstuvwxyz0123456789"))
-	if err == nil {
-		t.Fatal("Write should time out while transport credit is exhausted")
+	if err != nil {
+		t.Fatalf("Write returned error while queueing without backpressure: %v", err)
 	}
-	if !isTimeoutErr(err) {
-		t.Fatalf("Write error = %v, want timeout", err)
+	if n != 36 {
+		t.Fatalf("Write returned n=%d, want 36", n)
 	}
-	if n == 0 {
-		t.Fatalf("Write should report partial progress before timing out, got n=%d", n)
-	}
-	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
-		t.Fatalf("Write timed out too early: %v", elapsed)
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("Write blocked on transport credit for %v", elapsed)
 	}
 }
 
-func TestSessionWriteBackpressureResumesAfterCreditReturns(t *testing.T) {
+func TestSessionWriteDeadlineStillAppliesBeforeQueue(t *testing.T) {
 	const mtu = 32
-	conn := newControlledPacketConn(mtu - ARQ_OVERHEAD)
-	conn.blocked.Store(1)
-	addr := &mockAddr{"client-backpressure-resume"}
+	conn := newMockPacketConn()
+	addr := &mockAddr{"client-write-deadline"}
 	sess := NewARQSessionWithConfig(conn, addr, ARQConfig{
 		MTU:                mtu,
 		RTO:                50,
@@ -190,37 +183,16 @@ func TestSessionWriteBackpressureResumesAfterCreditReturns(t *testing.T) {
 	})
 	defer sess.Close()
 
-	writeDone := make(chan struct {
-		n   int
-		err error
-	}, 1)
-	payload := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
-	go func() {
-		n, err := sess.Write(payload)
-		writeDone <- struct {
-			n   int
-			err error
-		}{n: n, err: err}
-	}()
-
-	select {
-	case <-conn.tryCh:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for blocked transport write attempt")
+	if err := sess.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
-	conn.blocked.Store(0)
-
-	select {
-	case result := <-writeDone:
-		if result.err != nil {
-			t.Fatalf("Write resumed with error: %v", result.err)
-		}
-		if result.n != len(payload) {
-			t.Fatalf("Write resumed with n=%d, want %d", result.n, len(payload))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Write did not resume after transport credit returned")
+	n, err := sess.Write([]byte("abcdefghijklmnopqrstuvwxyz0123456789"))
+	if !isTimeoutErr(err) {
+		t.Fatalf("Write error = %v, want timeout", err)
+	}
+	if n != 0 {
+		t.Fatalf("Write with expired deadline returned n=%d, want 0", n)
 	}
 }
 
@@ -373,6 +345,115 @@ func TestCloseDrainTimeout_IsDerivedFromRTOBudget(t *testing.T) {
 	}
 }
 
+func TestCloseWithoutActivityDoesNotQueueFIN(t *testing.T) {
+	conn := newMockPacketConn()
+	sess := NewARQSessionWithConfig(conn, &mockAddr{"idle-peer"}, ARQConfig{
+		MTU:                ARQ_MTU,
+		RTO:                20,
+		MaxRetransmissions: 2,
+	})
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close idle session: %v", err)
+	}
+
+	conn.mu.Lock()
+	outgoing := len(conn.outgoing)
+	conn.mu.Unlock()
+	if outgoing != 0 {
+		t.Fatalf("idle Close queued %d packet(s), want 0", outgoing)
+	}
+}
+
+func TestCloseSignalsPeerEOFWithoutTransportClose(t *testing.T) {
+	aConn, bConn := newPacketPipe()
+	cfg := ARQConfig{
+		MTU:                1024,
+		RTO:                20,
+		MaxRetransmissions: 5,
+	}
+	a := NewARQSessionWithConfig(aConn, bConn.localAddr, cfg)
+	b := NewARQSessionWithConfig(bConn, aConn.localAddr, cfg)
+	defer b.Close()
+
+	if _, err := a.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	buf := make([]byte, 5)
+	b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(b, buf); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("payload = %q, want hello", buf)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- a.Close() }()
+
+	b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := b.Read(make([]byte, 1))
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after peer Close = n=%d err=%v, want EOF", n, err)
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close sender: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender Close did not drain after FIN ACK")
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("receiver Close after peer EOF: %v", err)
+	}
+}
+
+func TestRemoteFINReleasedWithDataDeliversDataBeforeEOF(t *testing.T) {
+	conn := newMockPacketConn()
+	addr := &mockAddr{"peer-fin-with-data"}
+	sess := NewARQSessionWithConfig(conn, addr, ARQConfig{
+		MTU:                ARQ_MTU,
+		RTO:                20,
+		MaxRetransmissions: 2,
+	})
+	defer sess.Close()
+
+	conn.Inject(makeARQDataPacket(0, []byte("first-")), addr)
+	conn.Inject(makeARQFINPacket(2), addr)
+	conn.Inject(makeARQDataPacket(1, []byte("second")), addr)
+
+	got := make([]byte, 0, len("first-second"))
+	buf := make([]byte, 16)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < len("first-second") {
+		if err := sess.SetReadDeadline(deadline); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		n, err := sess.Read(buf)
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if err != nil {
+			t.Fatalf("Read got %q before full payload: %v", got, err)
+		}
+	}
+	if string(got) != "first-second" {
+		t.Fatalf("payload = %q, want %q", got, "first-second")
+	}
+
+	if err := sess.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, err := sess.Read(buf)
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after payload = n=%d err=%v, want EOF", n, err)
+	}
+}
+
 func TestListenerDisconnectAbortsSession(t *testing.T) {
 	conn := newMockPacketConn()
 	listener, err := ServeConn(conn, 1400, 0)
@@ -457,6 +538,46 @@ func TestReadBufferDoesNotBlockBackgroundLoop(t *testing.T) {
 	}
 }
 
+func TestDeliverDataWakesReaderWhenBatchExceedsReadBuffer(t *testing.T) {
+	conn := newMockPacketConn()
+	addr := &mockAddr{"client-small-buffer"}
+	sess := newARQSessionWithConfig(conn, addr, ARQConfig{
+		MTU:     100,
+		WndSize: 1,
+	}, false)
+	defer sess.Close()
+
+	payload0 := make([]byte, 80)
+	payload1 := make([]byte, 80)
+	for i := range payload0 {
+		payload0[i] = byte(i)
+		payload1[i] = byte(80 + i)
+	}
+
+	sess.arq.Input(makeARQDataPacket(0, payload0))
+	sess.arq.Input(makeARQDataPacket(1, payload1))
+	sess.NotifyInput()
+
+	got := make([]byte, 0, len(payload0)+len(payload1))
+	buf := make([]byte, 160)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < cap(got) {
+		sess.SetReadDeadline(deadline)
+		n, err := sess.Read(buf[:cap(got)-len(got)])
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if err != nil {
+			t.Fatalf("Read got %d/%d bytes: %v", len(got), cap(got), err)
+		}
+	}
+
+	want := append(append([]byte(nil), payload0...), payload1...)
+	if string(got) != string(want) {
+		t.Fatal("delivered data mismatch")
+	}
+}
+
 // TestMonitorDrainsWhenBackgroundLoopBlocked confirms that the listener's
 // monitor continues to drain the shared conn even when a session's
 // backgroundLoop is blocked. This proves SimplexServer's buffer won't fill up.
@@ -532,4 +653,12 @@ func TestARQSession_ConcurrencySuite(t *testing.T) {
 	harnessarq.TestConcurrency(t, func(t *testing.T) (c1, c2 net.Conn, stop func(), err error) {
 		return arqMakePipe()
 	})
+}
+
+func TestARQSession_ResilienceSuite(t *testing.T) {
+	harnessarq.TestResilience(t, arqMakeFaultyPipe)
+}
+
+func TestARQSession_AsymmetricScenarios(t *testing.T) {
+	harnessarq.TestAsymmetricScenarios(t, arqMakeFaultyPipe)
 }

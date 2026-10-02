@@ -64,11 +64,12 @@ const (
 
 // DNS 配置结构
 type DNSConfig struct {
-	Domain   string        // 基础域名
-	Interval time.Duration // 发包间隔
-	Timeout  time.Duration // 请求超时
-	MaxSize  int           // 最大消息大小
-	Protocol string        // 协议类型: "udp", "tcp", "doh", "dot"等
+	Domain          string        // 基础域名
+	AuthoritativeNS string        // 授权NS主机名
+	Interval        time.Duration // 发包间隔
+	Timeout         time.Duration // 请求超时
+	MaxSize         int           // 最大消息大小
+	Protocol        string        // 协议类型: "udp", "tcp", "doh", "dot"等
 
 	// TLS相关配置
 	TLSConfig *tls.Config // TLS配置
@@ -108,6 +109,9 @@ func ResolveDNSAddr(network, address string) (*SimplexAddr, error) {
 	} else {
 		return nil, fmt.Errorf("domain is required")
 	}
+	if ns := u.Query().Get("ns"); ns != "" {
+		config.AuthoritativeNS = ns
+	}
 
 	// 解析间隔
 	if iv := u.Query().Get("interval"); iv != "" {
@@ -132,7 +136,7 @@ func ResolveDNSAddr(network, address string) (*SimplexAddr, error) {
 		available := MaxDomainLength - len(config.Domain) - 9 // connID(8) + dot(1)
 		// 每 64 字符 (63 data + 1 dot) 中有 63 字符是数据
 		b58Chars := available * MaxLabelLength / (MaxLabelLength + 1) // 去掉 label dots
-		config.MaxSize = int(float64(b58Chars) / 1.37)               // B58 decode shrink
+		config.MaxSize = int(float64(b58Chars) / 1.37)                // B58 decode shrink
 	}
 
 	// 解析超时时间
@@ -241,6 +245,9 @@ func getDNSConfig(addr *SimplexAddr) *DNSConfig {
 	if method := addr.options.Get("method"); method != "" {
 		config.HTTPMethod = method
 	}
+	if ns := addr.options.Get("ns"); ns != "" {
+		config.AuthoritativeNS = ns
+	}
 
 	return config
 }
@@ -256,10 +263,11 @@ func NewDNSServer(network, address string) (*DNSServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	server := &DNSServer{
-		addr:         addr,
-		domain:       config.Domain,
-		ctx:          ctx,
-		cancel:       cancel,
+		addr:            addr,
+		domain:          config.Domain,
+		authoritativeNS: config.AuthoritativeNS,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	// 启动DNS服务器
@@ -324,11 +332,12 @@ func NewDNSClient(addr *SimplexAddr) (*DNSClient, error) {
 
 // DNSServer 实现服务端的PacketConn接口
 type DNSServer struct {
-	server     *dns.Server
-	httpServer *http.Server
-	addr       *SimplexAddr
-	buffers    sync.Map
-	domain     string
+	server          *dns.Server
+	httpServer      *http.Server
+	addr            *SimplexAddr
+	buffers         sync.Map
+	domain          string
+	authoritativeNS string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -358,8 +367,17 @@ func (c *DNSClient) Receive() (*SimplexPacket, *SimplexAddr, error) {
 		return nil, nil, io.ErrClosedPipe
 	default:
 		data, err := c.buffer.RecvGet()
-		if err != nil || data == nil {
+		if err != nil {
 			return nil, c.addr, err
+		}
+		if data == nil {
+			if _, err := c.Send(NewSimplexPackets(), c.addr); err != nil {
+				return nil, c.addr, err
+			}
+			data, err = c.buffer.RecvGet()
+			if err != nil || data == nil {
+				return nil, c.addr, err
+			}
 		}
 		pkt, err := ParseSimplexPacket(data)
 		if err != nil || pkt == nil {
@@ -370,6 +388,38 @@ func (c *DNSClient) Receive() (*SimplexPacket, *SimplexAddr, error) {
 		}
 		return pkt, c.addr, nil
 	}
+}
+
+func parseDNSPacketBatch(data []byte) ([]*SimplexPacket, error) {
+	packets, err := ParseSimplexPackets(data)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*SimplexPacket, 0, len(packets.Packets))
+	for _, pkt := range packets.Packets {
+		if pkt == nil {
+			continue
+		}
+		// Ignore malformed zero-value packets from invalid DNS payloads.
+		if pkt.PacketType == 0 && len(pkt.Data) == 0 {
+			continue
+		}
+		out = append(out, pkt)
+	}
+	return out, nil
+}
+
+func (c *DNSClient) enqueueResponsePackets(data []byte) error {
+	packets, err := parseDNSPacketBatch(data)
+	if err != nil {
+		return err
+	}
+	for _, pkt := range packets {
+		if err := c.buffer.RecvPut(pkt.Marshal()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *DNSClient) Send(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
@@ -384,8 +434,56 @@ func (c *DNSClient) Send(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
 	}
 }
 
+func splitDNSPacketBatches(pkts *SimplexPackets, maxSize int) ([]*SimplexPackets, error) {
+	if pkts == nil || pkts.Size() == 0 {
+		return []*SimplexPackets{NewSimplexPackets()}, nil
+	}
+	if maxSize <= 0 {
+		return nil, fmt.Errorf("invalid DNS max payload size: %d", maxSize)
+	}
+
+	batches := make([]*SimplexPackets, 0, 1)
+	current := NewSimplexPackets()
+	for _, pkt := range pkts.Packets {
+		if pkt == nil {
+			continue
+		}
+		if pkt.Size() > maxSize {
+			return nil, fmt.Errorf("DNS packet too large: %d > %d", pkt.Size(), maxSize)
+		}
+		if current.Size() > 0 && current.Size()+pkt.Size() > maxSize {
+			batches = append(batches, current)
+			current = NewSimplexPackets()
+		}
+		current.Append(pkt)
+	}
+	if current.Size() > 0 {
+		batches = append(batches, current)
+	}
+	if len(batches) == 0 {
+		batches = append(batches, NewSimplexPackets())
+	}
+	return batches, nil
+}
+
 // sendDNS 发送标准DNS查询 (UDP/TCP/DoT)
 func (c *DNSClient) sendDNS(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
+	batches, err := splitDNSPacketBatches(pkts, addr.maxBodySize)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, batch := range batches {
+		n, err := c.sendDNSOnce(batch, addr)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (c *DNSClient) sendDNSOnce(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
 	data := pkts.Marshal()
 
 	var dataToSend []byte
@@ -396,6 +494,8 @@ func (c *DNSClient) sendDNS(pkts *SimplexPackets, addr *SimplexAddr) (int, error
 			// Full data fits
 			dataToSend = data
 			actualSent = len(data)
+		} else {
+			return 0, fmt.Errorf("DNS packet batch too large: %d > %d", len(data), addr.maxBodySize)
 		}
 	} else {
 		// For polling (p is nil), send empty query to trigger response
@@ -456,7 +556,9 @@ func (c *DNSClient) sendDNS(pkts *SimplexPackets, addr *SimplexAddr) (int, error
 			if combinedTxt != "" {
 				decoded := encoders.B58Decode(combinedTxt)
 				if len(decoded) > 0 {
-					c.buffer.RecvPut(decoded)
+					if err := c.enqueueResponsePackets(decoded); err != nil {
+						return 0, fmt.Errorf("decode DNS response packets: %w", err)
+					}
 				}
 			}
 		}
@@ -467,6 +569,22 @@ func (c *DNSClient) sendDNS(pkts *SimplexPackets, addr *SimplexAddr) (int, error
 
 // sendDoH 发送DoH查询
 func (c *DNSClient) sendDoH(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
+	batches, err := splitDNSPacketBatches(pkts, addr.maxBodySize)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, batch := range batches {
+		n, err := c.sendDoHOnce(batch, addr)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (c *DNSClient) sendDoHOnce(pkts *SimplexPackets, addr *SimplexAddr) (int, error) {
 	data := pkts.Marshal()
 
 	var dataToSend []byte
@@ -476,6 +594,8 @@ func (c *DNSClient) sendDoH(pkts *SimplexPackets, addr *SimplexAddr) (int, error
 		if len(data) <= addr.maxBodySize {
 			dataToSend = data
 			actualSent = len(data)
+		} else {
+			return 0, fmt.Errorf("DoH packet batch too large: %d > %d", len(data), addr.maxBodySize)
 		}
 	} else {
 		dataToSend = nil
@@ -557,7 +677,9 @@ func (c *DNSClient) sendDoH(pkts *SimplexPackets, addr *SimplexAddr) (int, error
 			if combinedTxt != "" {
 				decoded := encoders.B58Decode(combinedTxt)
 				if len(decoded) > 0 {
-					c.buffer.RecvPut(decoded)
+					if err := c.enqueueResponsePackets(decoded); err != nil {
+						return 0, fmt.Errorf("decode DoH response packets: %w", err)
+					}
 				}
 			}
 		}
@@ -747,6 +869,7 @@ func (c *DNSServer) processDNSQuery(r *dns.Msg) *dns.Msg {
 
 	response := new(dns.Msg)
 	response.SetReply(r)
+	response.Compress = true
 
 	// 检查查询类型
 	if len(r.Question) == 0 {
@@ -782,6 +905,10 @@ func (c *DNSServer) processDNSQuery(r *dns.Msg) *dns.Msg {
 	}
 	// 处理NS记录查询 - 为子域名返回权威NS记录
 	if qtype == dns.TypeNS {
+		nsTarget := c.domain
+		if c.authoritativeNS != "" {
+			nsTarget = c.authoritativeNS
+		}
 		// 创建NS记录，指向当前DNS服务器
 		nsRecord := &dns.NS{
 			Hdr: dns.RR_Header{
@@ -790,10 +917,10 @@ func (c *DNSServer) processDNSQuery(r *dns.Msg) *dns.Msg {
 				Class:  dns.ClassINET,
 				Ttl:    300,
 			},
-			Ns: dns.Fqdn(c.domain), // 指向配置的域名
+			Ns: dns.Fqdn(nsTarget),
 		}
 		response.Answer = append(response.Answer, nsRecord)
-		logs.Log.Debugf("DNSServer: Responded to NS query for %s with %s", queryName, c.domain)
+		logs.Log.Debugf("DNSServer: Responded to NS query for %s with %s", queryName, nsTarget)
 		return response
 	}
 
@@ -824,12 +951,14 @@ func (c *DNSServer) processDNSQuery(r *dns.Msg) *dns.Msg {
 			dataStr := strings.Join(dataLabels, "")
 			decoded := encoders.B58Decode(dataStr)
 			if len(decoded) > 0 {
-				packet, err := ParseSimplexPacket(decoded)
+				packets, err := parseDNSPacketBatch(decoded)
 				if err != nil {
 					return response
 				}
-				logs.Log.Debugf("DNSServer: Received packet from %s, size: %d", addr.String(), len(decoded))
-				buf.ReadBuf().PutPacket(packet)
+				logs.Log.Debugf("DNSServer: Received %d packets from %s, size: %d", len(packets), addr.String(), len(decoded))
+				for _, packet := range packets {
+					buf.ReadBuf().PutPacket(packet)
+				}
 			}
 		}
 	}

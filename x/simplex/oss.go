@@ -39,6 +39,16 @@ const (
 	MaxOSSMessageSize  = 1024 * 1024       // 1MB
 	DefaultOSSTimeout  = 30 * time.Second  // 30 seconds
 	SessionTimeout     = 300 * time.Second // 5 minutes session timeout (cloud storage high latency)
+
+	ossARQMinRTO             = 5 * time.Second
+	ossARQMaxRTO             = 30 * time.Second
+	ossARQRTOTicks           = 30
+	ossARQTargetWindowItems  = 16
+	ossARQMinWindowBytes     = 4 * 1024 * 1024
+	ossARQMaxWindowBytes     = 16 * 1024 * 1024
+	ossARQMaxWindowSegments  = 256
+	ossARQMaxAckSegments     = 16
+	ossARQDefaultRetransmits = 20
 )
 
 // OSSConfig contains configuration for OSS connection.
@@ -56,6 +66,7 @@ type OSSConfig struct {
 	ServerAddr   string        // Server HTTP address for mirror back-to-origin
 	Timeout      time.Duration // HTTP timeout
 	Mode         string        // "mirror" or "file" (default: "file")
+	SequenceMode bool          // file mode sequenced object pipeline
 	ARQ          arq.ARQConfig
 }
 
@@ -74,28 +85,101 @@ func normalizeOSSConfig(config *OSSConfig) {
 		config.Timeout = DefaultOSSTimeout
 	}
 	if config.ARQ.MTU <= 0 {
-		mtu := config.MaxBodySize - 5
-		if mtu <= 0 {
-			mtu = arq.ARQ_MTU
-		}
-		if mtu > arq.ARQ_MAX_MTU {
-			mtu = arq.ARQ_MAX_MTU
-		}
-		config.ARQ.MTU = mtu
+		config.ARQ.MTU = ossARQMTU(config.MaxBodySize)
+	}
+
+	mss := config.ARQ.MTU - arq.ARQ_OVERHEAD
+	if mss <= 0 {
+		mss = arq.ARQ_MTU - arq.ARQ_OVERHEAD
+	}
+	if config.ARQ.WndSize <= 0 {
+		config.ARQ.WndSize = ossARQWindowSize(config.MaxBodySize, mss)
 	}
 	if config.ARQ.RTO <= 0 {
-		rto := 2 * config.Interval
-		if config.Timeout > rto {
-			rto = config.Timeout
-		}
-		config.ARQ.RTO = int(rto.Milliseconds())
+		config.ARQ.RTO = int(ossARQRTO(config.Interval).Milliseconds())
 	}
 	if config.ARQ.StandaloneAckSegments <= 0 {
-		config.ARQ.StandaloneAckSegments = arq.ARQ_WND_SIZE / 2
+		config.ARQ.StandaloneAckSegments = ossARQAckSegments(config.MaxBodySize, mss, config.ARQ.WndSize)
 	}
 	if config.ARQ.MaxRetransmissions <= 0 {
-		config.ARQ.MaxRetransmissions = 6
+		config.ARQ.MaxRetransmissions = ossARQDefaultRetransmits
 	}
+}
+
+func ossARQMTU(maxBodySize int) int {
+	mtu := maxBodySize - 5
+	if mtu <= arq.ARQ_OVERHEAD {
+		return arq.ARQ_MTU
+	}
+	if mtu > arq.ARQ_MAX_MTU {
+		return arq.ARQ_MAX_MTU
+	}
+	return mtu
+}
+
+func ossARQRTO(interval time.Duration) time.Duration {
+	rto := interval * ossARQRTOTicks
+	if rto < ossARQMinRTO {
+		return ossARQMinRTO
+	}
+	if rto > ossARQMaxRTO {
+		return ossARQMaxRTO
+	}
+	return rto
+}
+
+func ossARQWindowSize(maxBodySize, mss int) int {
+	target := maxBodySize * ossARQTargetWindowItems
+	if target < ossARQMinWindowBytes {
+		target = ossARQMinWindowBytes
+	}
+	if target > ossARQMaxWindowBytes {
+		target = ossARQMaxWindowBytes
+	}
+	wnd := target / mss
+	if wnd < 1 {
+		wnd = 1
+	}
+	if wnd > ossARQMaxWindowSegments {
+		wnd = ossARQMaxWindowSegments
+	}
+	return wnd
+}
+
+func ossARQAckSegments(maxBodySize, mss, wndSize int) int {
+	segsPerItem := maxBodySize / mss
+	if segsPerItem < 1 {
+		segsPerItem = 1
+	}
+	ackSegments := segsPerItem
+	if ackSegments > ossARQMaxAckSegments {
+		ackSegments = ossARQMaxAckSegments
+	}
+	if wndSize > 0 && ackSegments > wndSize/2 {
+		ackSegments = wndSize / 2
+	}
+	if ackSegments < 1 {
+		ackSegments = 1
+	}
+	return ackSegments
+}
+
+// ossSequenceMaxPendingFiles computes how many unprocessed send-files may
+// exist before the client considers the server stalled.
+// Called after normalizeOSSConfig, so all cfg fields are > 0.
+func ossSequenceMaxPendingFiles(maxBodySize int, cfg arq.ARQConfig) int {
+	mss := cfg.MTU - arq.ARQ_OVERHEAD
+	windowBytes := cfg.WndSize * mss
+	filesPerWindow := (windowBytes + maxBodySize - 1) / maxBodySize
+	// +2: one for the current in-flight window, one for margin during retransmit bursts
+	pending := filesPerWindow * (cfg.MaxRetransmissions + 2)
+	if pending < 256 {
+		pending = 256
+	}
+	if pending > 1024 {
+		pending = 1024
+	}
+	return pending
 }
 
 // OSSObjectInfo represents an object returned by ListObjects
@@ -448,6 +532,9 @@ func ResolveOSSAddr(network, address string) (*SimplexAddr, error) {
 		prefix = path[:lastSlash+1] // Include trailing /
 		sessionId = path[lastSlash+1:]
 	}
+	if queryPrefix := u.Query().Get("prefix"); queryPrefix != "" {
+		prefix = normalizeDirectoryPrefix(queryPrefix, true)
+	}
 
 	// Parse configuration from query parameters
 	var interval int
@@ -503,6 +590,7 @@ func ResolveOSSAddr(network, address string) (*SimplexAddr, error) {
 			mode = "file"
 		}
 	}
+	sequenceMode := u.Query().Get("seq") == "true"
 
 	// Check credentials mode
 	if accessKeyId == "" && accessSecret == "" {
@@ -523,15 +611,21 @@ func ResolveOSSAddr(network, address string) (*SimplexAddr, error) {
 		ServerAddr:   serverAddr,
 		Timeout:      timeout,
 		Mode:         mode,
+		SequenceMode: sequenceMode,
 	}
 	normalizeOSSConfig(config)
 
+	itemsPerCycle := 1
+	if config.SequenceMode {
+		itemsPerCycle = seqMaxOpsPerTick
+	}
 	addr := &SimplexAddr{
-		URL:         u,
-		id:          sessionId,
-		interval:    config.Interval,
-		maxBodySize: maxBodySize,
-		options:     u.Query(),
+		URL:           u,
+		id:            sessionId,
+		interval:      config.Interval,
+		maxBodySize:   config.MaxBodySize,
+		itemsPerCycle: itemsPerCycle,
+		options:       u.Query(),
 	}
 	addr.SetConfig(config)
 
@@ -543,11 +637,20 @@ type OSSSession struct {
 	sessionId  string
 	buffer     *AsymBuffer
 	addr       *SimplexAddr
+	activityMu sync.RWMutex
 	lastActive time.Time
 }
 
 func (s *OSSSession) LastActive() time.Time {
+	s.activityMu.RLock()
+	defer s.activityMu.RUnlock()
 	return s.lastActive
+}
+
+func (s *OSSSession) Touch() {
+	s.activityMu.Lock()
+	defer s.activityMu.Unlock()
+	s.lastActive = time.Now()
 }
 
 // OSSServer implements server-side OSS simplex
@@ -604,6 +707,14 @@ func newOSSMirrorServer(addr *SimplexAddr, config *OSSConfig, connector OSSConne
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(config.Prefix, server.handleMirrorRequest)
+	server.httpServer = &http.Server{
+		Addr:         config.ServerAddr,
+		Handler:      mux,
+		ReadTimeout:  config.Timeout,
+		WriteTimeout: config.Timeout,
+	}
 
 	// Start HTTP server for mirror back-to-origin
 	go server.startHTTPServer()
@@ -623,18 +734,6 @@ func newOSSMirrorServer(addr *SimplexAddr, config *OSSConfig, connector OSSConne
 
 // startHTTPServer starts HTTP server for mirror back-to-origin
 func (s *OSSServer) startHTTPServer() {
-	mux := http.NewServeMux()
-
-	// Mirror back-to-origin endpoint: {prefix}*
-	mux.HandleFunc(s.config.Prefix, s.handleMirrorRequest)
-
-	s.httpServer = &http.Server{
-		Addr:         s.config.ServerAddr,
-		Handler:      mux,
-		ReadTimeout:  s.config.Timeout,
-		WriteTimeout: s.config.Timeout,
-	}
-
 	logs.Log.Infof("[OSS] Server HTTP listening on %s for %s*", s.config.ServerAddr, s.config.Prefix)
 
 	if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -744,7 +843,7 @@ func (s *OSSServer) pollSessionFile(session *OSSSession) {
 				logs.Log.Errorf("[OSS] Failed to write packets to buffer: %v", err)
 			}
 
-			session.lastActive = time.Now()
+			session.Touch()
 
 			// Delete processed file (important!)
 			if err := s.connector.DeleteObject(ossKey); err != nil {
@@ -1112,6 +1211,10 @@ func NewOSSFileServer(addr *SimplexAddr, config *OSSConfig, connector OSSConnect
 	cfg := ossFileTransportConfig()
 	cfg.Interval = config.Interval
 	cfg.MaxBodySize = config.MaxBodySize
+	cfg.SequenceMaxPendingFiles = ossSequenceMaxPendingFiles(config.MaxBodySize, config.ARQ)
+	if config.SequenceMode {
+		cfg.SequenceMode = true
+	}
 
 	fts := NewFileTransportServer(ops, dirPrefix, cfg, addr, ctx, cancel)
 	fts.StartPolling()
@@ -1169,6 +1272,10 @@ func NewOSSFileClient(addr *SimplexAddr, config *OSSConfig, connector OSSConnect
 	cfg := ossFileTransportConfig()
 	cfg.Interval = config.Interval
 	cfg.MaxBodySize = config.MaxBodySize
+	cfg.SequenceMaxPendingFiles = ossSequenceMaxPendingFiles(config.MaxBodySize, config.ARQ)
+	if config.SequenceMode {
+		cfg.SequenceMode = true
+	}
 
 	sendFile := dirPrefix + clientID + "_send"
 	recvFile := dirPrefix + clientID + "_recv"
@@ -1176,6 +1283,11 @@ func NewOSSFileClient(addr *SimplexAddr, config *OSSConfig, connector OSSConnect
 	ctx, cancel := context.WithCancel(context.Background())
 	buffer := NewSimplexBuffer(addr)
 	ftc := NewFileTransportClient(ops, cfg, buffer, sendFile, recvFile, addr, ctx, cancel)
+	if cfg.SequenceMode {
+		ftc.prefix = dirPrefix
+		ftc.clientID = clientID
+		ftc.seed = dirPrefix
+	}
 	ftc.StartMonitoring()
 
 	logs.Log.Infof("[OSS-File] Client created with clientID=%s", clientID)
@@ -1205,6 +1317,5 @@ func (c *OSSFileClient) Send(pkts *SimplexPackets, addr *SimplexAddr) (int, erro
 }
 
 func (c *OSSFileClient) Close() error {
-	c.cancel()
-	return nil
+	return c.ftc.Close()
 }

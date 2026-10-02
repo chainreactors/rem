@@ -65,6 +65,7 @@ type StreamHTTPListener struct {
 	listener   net.Listener
 	server     *http.Server
 	tlsEnabled bool
+	disableH2  bool
 
 	acceptCh  chan net.Conn
 	done      chan struct{}
@@ -102,6 +103,9 @@ func (l *StreamHTTPListener) Listen(dst string) (net.Listener, error) {
 	l.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if l.disableH2 {
+		l.server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	}
 
 	l.tlsEnabled = false

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +23,8 @@ import (
 var Agents = &agents{
 	Map: &sync.Map{},
 }
+
+var simplexYamuxStreamWindow uint32 = 4 * 1024 * 1024
 
 type agents struct {
 	*sync.Map
@@ -236,7 +240,7 @@ func (agent *Agent) Accept() (net.Conn, error) {
 }
 
 // LoginTimeout limits how long Login() / Dial() waits for the server's Ack.
-// On polling-based transports (cloud storage) the server may need
+// On polling-based transports (cloud storage, cloud storage) the server may need
 // several poll cycles to discover the new client.  Set high enough to handle
 // slow polling intervals (e.g. 3000ms cloud storage) without premature timeout.
 var LoginTimeout = 120 * time.Second
@@ -423,10 +427,6 @@ func (agent *Agent) Fork(ctrl *message.Control) (*Agent, error) {
 
 // 需要监听端口的那端
 func (agent *Agent) handlerInbound(local, remote *core.URL, control *message.Control) error {
-	err := agent.ListenAndServe(local, control)
-	if err != nil {
-		return err
-	}
 	if local.Scheme == "" {
 		return fmt.Errorf("relay is nil")
 	}
@@ -449,7 +449,11 @@ func (agent *Agent) handlerInbound(local, remote *core.URL, control *message.Con
 		return err
 	}
 	agent.Inbound = instant
-	return nil
+
+	// Publish the listener only after the protocol handler is ready. Otherwise
+	// an early connection can be accepted while Inbound is still nil and the
+	// bridge will forward protocol bytes directly to the remote SOCKS handler.
+	return agent.ListenAndServe(local, control)
 }
 
 func (agent *Agent) handlerOutbound(local, remote *core.URL, control *message.Control) error {
@@ -500,7 +504,7 @@ func (agent *Agent) handlerControl(control *message.Control) error {
 
 	if agent.Type == core.SERVER && control.InboundSide == core.SideRemote {
 		u := inboundURL.Copy()
-		u.SetHostname(agent.Hostname)
+		u.SetHostname(agent.ExternalIP)
 		logs.Log.Importantf("[agent.inbound] remote inbound serving: %s", u.String())
 	}
 
@@ -521,12 +525,11 @@ func (agent *Agent) handleMessage() error {
 	defer keepaliveTicker.Stop()
 	missedPongs := 0 // consecutive pings without pong reply
 
-	// pingNonces holds the last 2 nonces sent by this CLIENT.
-	// Only Pong messages that echo one of these nonces are accepted as live;
-	// stale Pongs cached on the transport (e.g. transport queue from before
-	// a network outage) have non-matching nonces and are discarded, so they
-	// cannot mask a dead connection and delay reconnect detection.
-	var pingNonces [2]string
+	// pingNonce is the nonce of the most recent ping. Only a pong echoing
+	// this exact nonce resets the missed counter. Accepting only the latest
+	// nonce (not a sliding window) prevents stale pongs cached on high-latency
+	// transports (Azure Blob, cloud storage) from masking a dead peer.
+	var pingNonce string
 
 	for {
 		var msg message.Message
@@ -545,20 +548,12 @@ func (agent *Agent) handleMessage() error {
 			}
 			return fmt.Errorf("all control streams closed: %w", err)
 		case <-keepaliveTicker.C:
-			// Only CLIENT performs keepalive checking; server only responds to pings.
-			if agent.Type != core.CLIENT {
-				continue
-			}
 			missedPongs++
 			if missedPongs >= KeepaliveMaxMissed {
 				return fmt.Errorf("keepalive timeout: %d consecutive pings unanswered", missedPongs)
 			}
-			// Rotate nonce ring: [prev, current] -> [current, new].
-			// Accepting the previous nonce too handles Pong responses that arrive
-			// one keepalive interval late (extremely slow networks).
 			nonce := utils.RandomString(8)
-			pingNonces[1] = pingNonces[0]
-			pingNonces[0] = nonce
+			pingNonce = nonce
 			// Send ping in a goroutine so a blocked yamux write cannot
 			// stall the select loop — the counter keeps incrementing
 			// and will eventually kill the agent even if Send hangs.
@@ -574,15 +569,15 @@ func (agent *Agent) handleMessage() error {
 		}
 		switch m := msg.(type) {
 		case *message.Pong:
-			// Only accept Pong if it echoes one of the last two nonces we sent.
-			// Stale Pongs (e.g. queued on transport before a network outage)
+			// Only accept Pong if it echoes the latest nonce we sent.
+			// Stale Pongs (e.g. queued on cloud storage before a network outage)
 			// carry old nonces and are silently ignored, allowing missedPongs
 			// to accumulate and trigger a reconnect when the link is truly dead.
-			if m.Pong == pingNonces[0] || m.Pong == pingNonces[1] {
+			if m.Pong == pingNonce {
 				missedPongs = 0
 				agent.Log("pong", logs.DebugLevel, "pong pong")
 			} else {
-				agent.Log("pong", logs.DebugLevel, "stale pong ignored (nonce mismatch)")
+				agent.Log("pong", logs.DebugLevel, "stale pong ignored (nonce %s != current %s)", m.Pong, pingNonce)
 			}
 		case *message.Ping:
 			agent.Log("ping", logs.DebugLevel, "ping %s", m.Ping)
@@ -763,16 +758,30 @@ func (agent *Agent) HistoryLog() string {
 	return agent.log.String()
 }
 
-// initYamux creates a yamux session over agent.Conn and opens stream 0 (control).
-// CLIENT is the yamux client (opens streams), SERVER is the yamux server (accepts streams).
-func (agent *Agent) initYamux() error {
+func (agent *Agent) yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
 	cfg.EnableKeepAlive = false                   // application-level keepalive is the sole liveness mechanism
 	cfg.ConnectionWriteTimeout = 30 * time.Second // yamux sender auto-reset timeout base
 	cfg.StreamOpenTimeout = 24 * time.Hour        // no yamux-level stream timeout; keepalive governs liveness
-	// Keep yamux's bounded default window so stream-level backpressure propagates
-	// into ARQ/simplex instead of allowing a single stream to flood the conn.
+
+	if agent.ConsoleURL != nil && agent.ConsoleURL.Tunnel == core.SimplexTunnel {
+		win := simplexYamuxStreamWindow
+		if v := os.Getenv("REM_YAMUX_WINDOW"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				win = uint32(n)
+			}
+		}
+		cfg.MaxStreamWindowSize = win
+	}
+
+	return cfg
+}
+
+// initYamux creates a yamux session over agent.Conn and opens stream 0 (control).
+// CLIENT is the yamux client (opens streams), SERVER is the yamux server (accepts streams).
+func (agent *Agent) initYamux() error {
+	cfg := agent.yamuxConfig()
 
 	var err error
 	if agent.Type == core.CLIENT {
@@ -856,13 +865,7 @@ func (agent *Agent) AttachConn(conn net.Conn, label string) error {
 func (agent *Agent) attachConnNow(conn net.Conn, label string) error {
 	conn = cio.WrapStatsConn(conn)
 
-	cfg := yamux.DefaultConfig()
-	cfg.LogOutput = io.Discard
-	cfg.EnableKeepAlive = false                   // application-level keepalive is the sole liveness mechanism
-	cfg.ConnectionWriteTimeout = 30 * time.Second // yamux sender auto-reset timeout base
-	cfg.StreamOpenTimeout = 24 * time.Hour        // no yamux-level stream timeout; keepalive governs liveness
-	// Keep yamux's bounded default window so stream-level backpressure propagates
-	// into ARQ/simplex instead of allowing a single stream to flood the conn.
+	cfg := agent.yamuxConfig()
 
 	var (
 		session *yamux.Session
@@ -1083,8 +1086,29 @@ func (agent *Agent) handleDataStream(stream net.Conn) {
 	}
 
 	// BridgeOpen hasn't arrived yet — park the stream in parent's pendingStreams.
-	// handleBridgeOpen (dispatched by parent) will check here.
+	// handleBridgeOpen (dispatched by parent) will check here. Re-check the
+	// bridge map after storing to close the race where BridgeOpen is handled
+	// between the first lookup above and this Store.
 	agent.pendingStreams.Store(id, stream)
+	if bridge, err := agent.getBridge(id); err == nil {
+		if value, loaded := agent.pendingStreams.LoadAndDelete(id); loaded {
+			bridge.attachStream(value.(net.Conn))
+			bridge.Handler(agent)
+		}
+		return
+	}
+
+	agent.children.Range(func(_, v interface{}) bool {
+		child := v.(*Agent)
+		if bridge, err := child.getBridge(id); err == nil {
+			if value, loaded := agent.pendingStreams.LoadAndDelete(id); loaded {
+				bridge.attachStream(value.(net.Conn))
+				bridge.Handler(child)
+			}
+			return false
+		}
+		return true
+	})
 }
 
 // handleBridgeOpen processes a BridgeOpen received on stream 0.

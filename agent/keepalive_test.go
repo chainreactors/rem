@@ -213,9 +213,10 @@ func TestKeepalive_TimeoutWithNoPong(t *testing.T) {
 	}
 }
 
-// TestKeepalive_PreviousNonceAccepted verifies that a Pong matching the
-// PREVIOUS nonce (one interval late) is still accepted.
-func TestKeepalive_PreviousNonceAccepted(t *testing.T) {
+// TestKeepalive_PreviousNonceRejected verifies that a Pong matching the
+// previous nonce is rejected. Only the latest nonce is accepted, so stale
+// pongs cached by high-latency transports cannot mask a dead peer.
+func TestKeepalive_PreviousNonceRejected(t *testing.T) {
 	oldInterval := KeepaliveInterval
 	oldMax := KeepaliveMaxMissed
 	KeepaliveInterval = 100 * time.Millisecond
@@ -258,20 +259,21 @@ func TestKeepalive_PreviousNonceAccepted(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- client.handleMessage() }()
 
-	// Let several cycles pass — delayed Pong should match pingNonces[1]
-	time.Sleep(800 * time.Millisecond)
-
-	client.Close(nil)
-
-	err := <-errCh
-	if err != nil {
-		t.Fatalf("handleMessage should not timeout with one-interval-late Pong, got: %v", err)
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected keepalive timeout (previous nonce should be rejected)")
+		}
+		t.Logf("OK: previous nonce rejected, got: %v", err)
+	case <-time.After(5 * time.Second):
+		client.Close(nil)
+		t.Fatal("timed out waiting for keepalive timeout")
 	}
 }
 
-// TestKeepalive_ServerSkipsKeepaliveCheck verifies that SERVER type agents
-// do NOT send pings or track missedPongs (only CLIENT does).
-func TestKeepalive_ServerSkipsKeepaliveCheck(t *testing.T) {
+// TestKeepalive_ServerTimesOutWithoutPong verifies that SERVER type agents
+// also perform keepalive checking.
+func TestKeepalive_ServerTimesOutWithoutPong(t *testing.T) {
 	oldInterval := KeepaliveInterval
 	oldMax := KeepaliveMaxMissed
 	KeepaliveInterval = 50 * time.Millisecond
@@ -284,23 +286,23 @@ func TestKeepalive_ServerSkipsKeepaliveCheck(t *testing.T) {
 	_, server, cleanup := newKeepaliveTestPair(t)
 	defer cleanup()
 
-	// Server handleMessage should NOT timeout even with no Pong
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.handleMessage() }()
 
-	// Wait longer than CLIENT timeout would be (2 × 50ms = 100ms)
-	time.Sleep(300 * time.Millisecond)
-
-	server.Close(nil)
-
-	err := <-errCh
-	if err != nil {
-		t.Fatalf("server should not timeout on keepalive, got: %v", err)
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected keepalive timeout error, got nil")
+		}
+		t.Logf("OK: server no-pong timeout: %v", err)
+	case <-time.After(5 * time.Second):
+		server.Close(nil)
+		t.Fatal("timed out waiting for server keepalive timeout")
 	}
 }
 
 // TestKeepalive_TwoIntervalOldNonceRejected verifies that a Pong echoing
-// a nonce from 2+ intervals ago is rejected (only last 2 accepted).
+// a nonce from 2+ intervals ago is rejected.
 func TestKeepalive_TwoIntervalOldNonceRejected(t *testing.T) {
 	oldInterval := KeepaliveInterval
 	oldMax := KeepaliveMaxMissed

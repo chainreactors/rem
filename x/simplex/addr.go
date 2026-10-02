@@ -21,12 +21,13 @@ func ResolveSimplexAddr(network, address string) (*SimplexAddr, error) {
 
 type SimplexAddr struct {
 	*url.URL
-	id          string
-	interval    time.Duration
-	maxBodySize int
-	options     url.Values
-	config      interface{} // 用于保存复杂配置对象，如 HTTPConfig, DNSConfig 等
-	mu          sync.RWMutex
+	id            string
+	interval      time.Duration
+	maxBodySize   int
+	itemsPerCycle int // 0 = use default; set by transport-specific resolver
+	options       url.Values
+	config        interface{} // 用于保存复杂配置对象，如 HTTPConfig, DNSConfig 等
+	mu            sync.RWMutex
 }
 
 type simplexARQConfigProvider interface {
@@ -34,20 +35,22 @@ type simplexARQConfigProvider interface {
 }
 
 func (addr *SimplexAddr) Clone(ip string) *SimplexAddr {
-	s, _ := url.Parse(addr.URL.String())
+	s, _ := url.Parse(addr.String())
 	s.Host = ip
 	addr.mu.RLock()
 	interval := addr.interval
 	maxBodySize := addr.maxBodySize
+	itemsPerCycle := addr.itemsPerCycle
 	config := addr.config
 	addr.mu.RUnlock()
 	return &SimplexAddr{
-		URL:         s,
-		id:          addr.id,
-		interval:    interval,
-		maxBodySize: maxBodySize,
-		config:      config,
-		options:     map[string][]string{},
+		URL:           s,
+		id:            addr.id,
+		interval:      interval,
+		maxBodySize:   maxBodySize,
+		itemsPerCycle: itemsPerCycle,
+		config:        config,
+		options:       map[string][]string{},
 	}
 }
 
@@ -57,9 +60,10 @@ func (addr *SimplexAddr) Network() string {
 
 func (addr *SimplexAddr) String() string {
 	addr.mu.RLock()
-	addr.URL.RawQuery = addr.options.Encode()
+	clonedURL := *addr.URL
+	clonedURL.RawQuery = addr.options.Encode()
 	addr.mu.RUnlock()
-	return addr.URL.String()
+	return clonedURL.String()
 }
 
 func (addr *SimplexAddr) Interval() time.Duration {
@@ -101,16 +105,18 @@ func (addr *SimplexAddr) ARQConfig() arq.ARQConfig {
 // 用户可通过 URL param `max_packet` 指定最大包大小，系统自动推导分片数。
 func (addr *SimplexAddr) SimplexConfig() SimplexConfig {
 	addr.mu.RLock()
-	defer addr.mu.RUnlock()
 	sc := SimplexConfig{
-		Interval:    addr.interval,
-		MaxBodySize: addr.maxBodySize,
+		Interval:      addr.interval,
+		MaxBodySize:   addr.maxBodySize,
+		ItemsPerCycle: addr.itemsPerCycle,
 	}
 	if v := addr.options.Get("max_packet"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			sc.MaxPacketSize = n
+			sc.ItemsPerCycle = 0
 		}
 	}
+	addr.mu.RUnlock()
 	sc.Normalize()
 	return sc
 }
@@ -125,10 +131,6 @@ func (addr *SimplexAddr) Config() interface{} {
 
 func (addr *SimplexAddr) SetConfig(config interface{}) {
 	addr.config = config
-}
-
-func (addr *SimplexAddr) GetConfig() interface{} {
-	return addr.config
 }
 
 // SetOption dynamically updates a configuration option.

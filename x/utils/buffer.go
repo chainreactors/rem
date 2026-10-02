@@ -136,8 +136,10 @@ func (b *Buffer) Cap() int {
 // atomic flag. This eliminates the send-on-closed-channel panic that would
 // otherwise race between concurrent Put() and Close() calls.
 type ChannelBuffer struct {
-	ch     chan []byte
-	closed int32 // atomic: 0=open, 1=closed
+	ch        chan []byte
+	closed    int32 // atomic: 0=open, 1=closed
+	closedCh  chan struct{}
+	closeOnce sync.Once
 }
 
 // NewChannel creates a ChannelBuffer that preserves packet boundaries.
@@ -147,7 +149,8 @@ func NewChannel(size int) *ChannelBuffer {
 		size = 1
 	}
 	return &ChannelBuffer{
-		ch: make(chan []byte, size),
+		ch:       make(chan []byte, size),
+		closedCh: make(chan struct{}),
 	}
 }
 
@@ -162,6 +165,37 @@ func (ch *ChannelBuffer) Get() ([]byte, error) {
 			return nil, io.ErrClosedPipe
 		}
 		return nil, nil
+	}
+}
+
+// GetWait blocks until a packet is available, the buffer is closed, or ctx is cancelled.
+// After Close, remaining packets are drained before returning ErrClosedPipe.
+func (ch *ChannelBuffer) GetWait(ctx context.Context) ([]byte, error) {
+	for {
+		select {
+		case data := <-ch.ch:
+			return data, nil
+		default:
+		}
+		if atomic.LoadInt32(&ch.closed) != 0 {
+			return nil, io.ErrClosedPipe
+		}
+
+		if ctx == nil {
+			select {
+			case data := <-ch.ch:
+				return data, nil
+			case <-ch.closedCh:
+			}
+		} else {
+			select {
+			case data := <-ch.ch:
+				return data, nil
+			case <-ch.closedCh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 	}
 }
 
@@ -211,7 +245,10 @@ func (ch *ChannelBuffer) PutWait(ctx context.Context, data []byte) error {
 // The underlying Go channel is intentionally NOT closed to avoid send-on-closed-channel
 // panics from concurrent Put() calls.
 func (ch *ChannelBuffer) Close() error {
-	atomic.StoreInt32(&ch.closed, 1)
+	ch.closeOnce.Do(func() {
+		atomic.StoreInt32(&ch.closed, 1)
+		close(ch.closedCh)
+	})
 	return nil
 }
 

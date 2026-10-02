@@ -46,6 +46,7 @@ import (
 	_ "github.com/chainreactors/rem/protocol/tunnel/streamhttp"
 	_ "github.com/chainreactors/rem/protocol/tunnel/tcp"
 	_ "github.com/chainreactors/rem/protocol/tunnel/udp"
+	_ "github.com/chainreactors/rem/protocol/tunnel/unix"
 	_ "github.com/chainreactors/rem/protocol/tunnel/websocket"
 	_ "github.com/chainreactors/rem/protocol/wrapper"
 	"github.com/chainreactors/rem/x/cryptor"
@@ -179,15 +180,19 @@ func runReconfigureServerHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsoleWithCMD: %v", err)
 	}
+	runErrCh := make(chan error, 1)
 	go func() {
-		if err := console.Run(); err != nil {
-			t.Errorf("console.Run: %v", err)
-		}
+		runErrCh <- console.Run()
 	}()
 
 	var target *agent.Agent
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-runErrCh:
+			t.Fatalf("console.Run exited before agent connected: %v", err)
+		default:
+		}
 		if a, ok := agent.Agents.Get(expectedAlias); ok && a.Init {
 			target = a
 			break
@@ -2037,7 +2042,6 @@ func multiServeDualSOCKSConcurrentScenario() runner.Scenario {
 			var wg sync.WaitGroup
 			errs := make(chan error, reqsPerServe*2)
 			for _, endpoint := range []string{"socks_addr_1", "socks_addr_2"} {
-				endpoint := endpoint
 				addr := fx.Endpoint(endpoint)
 				for i := 0; i < reqsPerServe; i++ {
 					wg.Add(1)

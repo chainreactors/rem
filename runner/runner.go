@@ -66,6 +66,12 @@ func (c *Console) newAgent(urls *core.URLs, r *RunnerConfig) (*agent.Agent, erro
 		Username: resolveAgentUsername(),
 		Hostname: hostname,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if a == nil {
+		return nil, fmt.Errorf("agent.NewAgent returned nil agent")
+	}
 
 	a.Recover = func() error {
 		return c.Run()

@@ -1,5 +1,3 @@
-//go:build !tinygo
-
 package main
 
 /*
@@ -362,11 +360,12 @@ func MemoryClose(chandle C.int) C.int {
 func CleanupAgent() {
 	agent.Agents.Map.Range(func(key, value interface{}) bool {
 		if a, ok := value.(*agent.Agent); ok {
+			// Close removes the registry entry synchronously (compare-and-delete
+			// by pointer), so the next RemDial can reuse the same alias
+			// immediately after cleanup returns.
 			a.Close(nil)
+			agent.Agents.CompareAndDelete(key, a)
 		}
-		// Drop the registry entry synchronously so the next RemDial can
-		// reuse the same alias immediately after cleanup returns.
-		agent.Agents.Delete(key)
 		return true
 	})
 }

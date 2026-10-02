@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/chainreactors/rem/x/arq"
 )
 
 // --- Unit Tests ---
@@ -76,6 +78,177 @@ func TestResolveOSSAddr_Constants(t *testing.T) {
 	}
 	if config.MaxBodySize != 1024*1024 {
 		t.Fatalf("expected MaxBodySize=1MB, got %d", config.MaxBodySize)
+	}
+}
+
+func TestResolveOSSAddr_PathPrefixParsing(t *testing.T) {
+	tests := []struct {
+		raw         string
+		prefix      string
+		hasAutoID   bool
+		fixedSessID string
+	}{
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/", "/", true, ""},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/dir/", "/dir/", true, ""},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/dir/sub/", "/dir/sub/", true, ""},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/session", "/", false, "session"},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/dir/session", "/dir/", false, "session"},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/?prefix=dir/sub", "/dir/sub/", true, ""},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/session?prefix=/dir/sub/", "/dir/sub/", false, "session"},
+		{"oss://bucket.oss-cn-hangzhou.aliyuncs.com/dir/?prefix=other", "/other/", true, ""},
+	}
+
+	for _, tc := range tests {
+		addr, err := ResolveOSSAddr("oss", tc.raw)
+		if err != nil {
+			t.Fatalf("ResolveOSSAddr(%s): %v", tc.raw, err)
+		}
+		config := addr.Config().(*OSSConfig)
+		if config.Prefix != tc.prefix {
+			t.Fatalf("url=%s: prefix=%q, want %q", tc.raw, config.Prefix, tc.prefix)
+		}
+		if tc.hasAutoID && len(config.SessionID) != 8 {
+			t.Fatalf("url=%s: auto session id=%q, want 8 chars", tc.raw, config.SessionID)
+		}
+		if !tc.hasAutoID && config.SessionID == "" {
+			t.Fatalf("url=%s: expected fixed session id", tc.raw)
+		}
+		if tc.fixedSessID != "" && config.SessionID != tc.fixedSessID {
+			t.Fatalf("url=%s: session id=%q, want %q", tc.raw, config.SessionID, tc.fixedSessID)
+		}
+	}
+}
+
+func TestResolveOSSAddr_AutoARQConfig(t *testing.T) {
+	addr, err := ResolveOSSAddr("oss", "oss://bucket.oss-cn-shanghai.aliyuncs.com/prefix/?interval=100&timeout=30")
+	if err != nil {
+		t.Fatalf("ResolveOSSAddr: %v", err)
+	}
+	cfg := addr.ARQConfig()
+
+	if cfg.RTO != 5000 {
+		t.Fatalf("RTO = %dms, want 5000ms", cfg.RTO)
+	}
+	if cfg.MTU != arq.ARQ_MAX_MTU {
+		t.Fatalf("MTU = %d, want %d", cfg.MTU, arq.ARQ_MAX_MTU)
+	}
+	if cfg.WndSize != 256 {
+		t.Fatalf("WndSize = %d, want 256", cfg.WndSize)
+	}
+	if cfg.StandaloneAckSegments != 16 {
+		t.Fatalf("StandaloneAckSegments = %d, want 16", cfg.StandaloneAckSegments)
+	}
+	if cfg.MaxRetransmissions != 20 {
+		t.Fatalf("MaxRetransmissions = %d, want 20", cfg.MaxRetransmissions)
+	}
+}
+
+func TestResolveOSSAddr_AutoSimplexConfig(t *testing.T) {
+	addr, err := ResolveOSSAddr("oss", "oss://bucket.oss-cn-shanghai.aliyuncs.com/prefix/?interval=100&seq=true")
+	if err != nil {
+		t.Fatalf("ResolveOSSAddr: %v", err)
+	}
+
+	sc := addr.SimplexConfig()
+	if sc.ItemsPerCycle != seqMaxOpsPerTick {
+		t.Fatalf("ItemsPerCycle = %d, want %d", sc.ItemsPerCycle, seqMaxOpsPerTick)
+	}
+	if sc.DataBudget() != MaxOSSMessageSize*seqMaxOpsPerTick {
+		t.Fatalf("DataBudget = %d, want %d", sc.DataBudget(), MaxOSSMessageSize*seqMaxOpsPerTick)
+	}
+}
+
+func TestNormalizeOSSConfig_Variants(t *testing.T) {
+	tests := []struct {
+		name  string
+		input OSSConfig
+		check func(t *testing.T, cfg *OSSConfig)
+	}{
+		{
+			name:  "default 1MB",
+			input: OSSConfig{Interval: 100 * time.Millisecond},
+			check: func(t *testing.T, cfg *OSSConfig) {
+				if cfg.ARQ.MTU != arq.ARQ_MAX_MTU {
+					t.Fatalf("MTU = %d, want %d", cfg.ARQ.MTU, arq.ARQ_MAX_MTU)
+				}
+				if cfg.ARQ.WndSize != 256 {
+					t.Fatalf("WndSize = %d, want 256", cfg.ARQ.WndSize)
+				}
+				if cfg.ARQ.RTO != 5000 {
+					t.Fatalf("RTO = %d, want 5000", cfg.ARQ.RTO)
+				}
+				if cfg.ARQ.MaxRetransmissions != 20 {
+					t.Fatalf("MaxRetransmissions = %d, want 20", cfg.ARQ.MaxRetransmissions)
+				}
+			},
+		},
+		{
+			name:  "small 64KB body",
+			input: OSSConfig{MaxBodySize: 64 * 1024, Interval: 100 * time.Millisecond},
+			check: func(t *testing.T, cfg *OSSConfig) {
+				if cfg.ARQ.WndSize < 64 {
+					t.Fatalf("WndSize = %d, want >= 64 for 64KB body", cfg.ARQ.WndSize)
+				}
+			},
+		},
+		{
+			name:  "preset ARQ not overwritten",
+			input: OSSConfig{Interval: 100 * time.Millisecond, ARQ: arq.ARQConfig{WndSize: 32, MTU: 1000, RTO: 2000}},
+			check: func(t *testing.T, cfg *OSSConfig) {
+				if cfg.ARQ.WndSize != 32 {
+					t.Fatalf("WndSize = %d, want 32 (preset)", cfg.ARQ.WndSize)
+				}
+				if cfg.ARQ.MTU != 1000 {
+					t.Fatalf("MTU = %d, want 1000 (preset)", cfg.ARQ.MTU)
+				}
+				if cfg.ARQ.RTO != 2000 {
+					t.Fatalf("RTO = %d, want 2000 (preset)", cfg.ARQ.RTO)
+				}
+			},
+		},
+		{
+			name:  "seq mode itemsPerCycle",
+			input: OSSConfig{Interval: 100 * time.Millisecond, SequenceMode: true},
+			check: func(t *testing.T, cfg *OSSConfig) {
+				// SequenceMode only affects itemsPerCycle via ResolveOSSAddr, not normalizeOSSConfig
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.input
+			normalizeOSSConfig(&cfg)
+			if cfg.ARQ.MTU <= 0 || cfg.ARQ.WndSize <= 0 || cfg.ARQ.RTO <= 0 || cfg.ARQ.MaxRetransmissions <= 0 {
+				t.Fatalf("normalize left zero fields: MTU=%d WndSize=%d RTO=%d MaxRetrans=%d",
+					cfg.ARQ.MTU, cfg.ARQ.WndSize, cfg.ARQ.RTO, cfg.ARQ.MaxRetransmissions)
+			}
+			tt.check(t, &cfg)
+		})
+	}
+}
+
+func TestSimplexBuffer_QueueCapScalesWithARQWindow(t *testing.T) {
+	config := &OSSConfig{Interval: 100 * time.Millisecond}
+	normalizeOSSConfig(config)
+
+	u, _ := url.Parse("oss://bucket.oss-cn-shanghai.aliyuncs.com/prefix/")
+	addr := &SimplexAddr{
+		URL:         u,
+		interval:    config.Interval,
+		maxBodySize: config.MaxBodySize,
+		options:     u.Query(),
+	}
+	addr.SetConfig(config)
+
+	buf := NewSimplexBuffer(addr)
+	wndSize := config.ARQ.WndSize
+	if buf.dataCap < wndSize {
+		t.Fatalf("sendCap (%d) < ARQ WndSize (%d)", buf.dataCap, wndSize)
+	}
+	for i := 0; i < wndSize*2; i++ {
+		if err := buf.recvBuf.Put([]byte{1}); err != nil {
+			t.Fatalf("recvCap should follow ARQ window, failed at %d/%d: %v", i, wndSize*2, err)
+		}
 	}
 }
 

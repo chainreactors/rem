@@ -54,17 +54,31 @@ func createHTTPClient(proxyURL string, timeout ...time.Duration) *http.Client {
 	}
 
 	transport := http.RoundTripper(&http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   t,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
 		// force HTTP/1.1: prevent "malformed HTTP version HTTP/2" errors when
 		// servers (e.g. login.microsoftonline.com) respond with HTTP/2
-		TLSNextProto:      make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-		DisableKeepAlives: true,
-		Proxy:             http.ProxyFromEnvironment,
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		TLSHandshakeTimeout:   t,
+		ResponseHeaderTimeout: t,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
 	})
 
-	if proxyURL != "" {
+	if proxyURL == "direct" {
+		// proxy=direct: 强制直连，忽略 HTTP_PROXY / HTTPS_PROXY 环境变量
+		if httpTransport, ok := transport.(*http.Transport); ok {
+			httpTransport.Proxy = nil
+		}
+	} else if proxyURL != "" {
 		parsedURL, err := url.Parse(proxyURL)
 		if err == nil {
 			// 使用内部的 proxyclient 库，覆盖环境变量代理
@@ -133,6 +147,20 @@ func getOption(addr *SimplexAddr, key string) string {
 	}
 
 	return ""
+}
+
+func normalizeDirectoryPrefix(prefix string, leadingSlash bool) string {
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		if leadingSlash {
+			return "/"
+		}
+		return ""
+	}
+	if leadingSlash {
+		return "/" + prefix + "/"
+	}
+	return prefix + "/"
 }
 
 // validateSeed checks that a seed contains only alphanumeric characters and

@@ -20,7 +20,7 @@ func TestARQBasicSendRecv(t *testing.T) {
 		mu.Unlock()
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send data
 	testData := []byte("hello world")
@@ -73,7 +73,7 @@ func TestARQLargeMTUIsCappedToUint16Payload(t *testing.T) {
 	var outputs [][]byte
 	var mu sync.Mutex
 
-	arq := NewARQWithConfig(1, func(data []byte) {
+	arq := NewARQWithConfig(func(data []byte) {
 		mu.Lock()
 		cp := make([]byte, len(data))
 		copy(cp, data)
@@ -118,7 +118,7 @@ func TestARQLargeMTUIsCappedToUint16Payload(t *testing.T) {
 
 // TestARQRecvInOrder tests receiving packets in order
 func TestARQRecvInOrder(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Send packets in order
 	packets := [][]byte{
@@ -141,7 +141,7 @@ func TestARQRecvInOrder(t *testing.T) {
 
 // TestARQRecvOutOfOrder tests receiving packets out of order
 func TestARQRecvOutOfOrder(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Send packets out of order: 0, 2, 1
 	arq.Input(makeARQDataPacket(0, []byte("packet0")))
@@ -174,9 +174,54 @@ func TestARQRecvOutOfOrder(t *testing.T) {
 	}
 }
 
+func TestARQFINIsOrderedAfterData(t *testing.T) {
+	arq := NewSimpleARQ(func([]byte) {})
+
+	arq.Input(makeARQFINPacket(1))
+	if arq.remoteDone() {
+		t.Fatal("FIN was delivered before missing DATA")
+	}
+	if data := arq.Recv(); len(data) != 0 {
+		t.Fatalf("Recv before missing DATA = %q, want empty", data)
+	}
+
+	arq.Input(makeARQDataPacket(0, []byte("payload")))
+	if !arq.remoteDone() {
+		t.Fatal("FIN was not delivered after preceding DATA arrived")
+	}
+	if data := arq.Recv(); string(data) != "payload" {
+		t.Fatalf("Recv = %q, want payload", data)
+	}
+}
+
+func TestARQDuplicateFINReacks(t *testing.T) {
+	var outputs [][]byte
+	arq := NewSimpleARQ(func(data []byte) {
+		outputs = append(outputs, append([]byte(nil), data...))
+	})
+
+	arq.Input(makeARQFINPacket(0))
+	arq.Input(makeARQFINPacket(0))
+
+	if len(outputs) != 2 {
+		t.Fatalf("ACK count = %d, want 2", len(outputs))
+	}
+	for i, out := range outputs {
+		if len(out) < ARQ_OVERHEAD {
+			t.Fatalf("output[%d] too short: %d", i, len(out))
+		}
+		if out[0] != CMD_ACK {
+			t.Fatalf("output[%d] cmd = %d, want CMD_ACK", i, out[0])
+		}
+		if ack := binary.BigEndian.Uint32(out[5:9]); ack != 1 {
+			t.Fatalf("output[%d] ack = %d, want 1", i, ack)
+		}
+	}
+}
+
 // TestARQDuplicatePackets tests handling of duplicate packets
 func TestARQDuplicatePackets(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Send packet 0 twice
 	arq.Input(makeARQDataPacket(0, []byte("packet0")))
@@ -210,7 +255,7 @@ func TestARQNACKTriggering(t *testing.T) {
 		}
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send packets with a gap: 0, 1, 2, 6, 7, 8 (missing 3, 4, 5)
 	// With NACK threshold=1, any gap triggers NACK
@@ -255,7 +300,7 @@ func TestARQNACKRetransmit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send some data to populate send buffer
 	arq.Send([]byte("test"))
@@ -298,7 +343,7 @@ func TestARQStandaloneAckUsesUpdatedRcvNxt(t *testing.T) {
 	var ackPackets [][]byte
 	var mu sync.Mutex
 
-	arq := NewARQWithConfig(1, func(data []byte) {
+	arq := NewARQWithConfig(func(data []byte) {
 		if len(data) >= ARQ_OVERHEAD && data[0] == CMD_ACK {
 			mu.Lock()
 			pkt := make([]byte, len(data))
@@ -341,7 +386,7 @@ func TestARQFragmentation(t *testing.T) {
 	}
 
 	mtu := 100
-	arq := NewSimpleARQWithMTU(1, output, mtu, 0)
+	arq := NewSimpleARQWithMTU(output, mtu)
 
 	// Send data larger than MSS
 	largeData := make([]byte, mtu*3)
@@ -379,7 +424,7 @@ func TestARQFragmentation(t *testing.T) {
 
 // TestARQWaitSnd tests WaitSnd counter
 func TestARQWaitSnd(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	if arq.WaitSnd() != 0 {
 		t.Fatalf("Initial WaitSnd should be 0, got %d", arq.WaitSnd())
@@ -412,7 +457,7 @@ func TestARQBinaryFormat(t *testing.T) {
 	copy(pkt[ARQ_OVERHEAD:], payload)
 
 	// Parse it
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 	arq.Input(pkt)
 
 	// Since we sent SN=42 but ARQ expects SN=0, it should be buffered
@@ -423,7 +468,7 @@ func TestARQBinaryFormat(t *testing.T) {
 
 // TestARQCleanupOldSegments tests that old segments are cleaned up
 func TestARQCleanupOldSegments(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Send data
 	arq.Send([]byte("test"))
@@ -454,7 +499,7 @@ func TestARQCleanupOldSegments(t *testing.T) {
 
 // TestARQConcurrentAccess tests concurrent access to ARQ
 func TestARQConcurrentAccess(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	var wg sync.WaitGroup
 	iterations := 100
@@ -491,29 +536,9 @@ func TestARQConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestARQTimeout tests timeout configuration
-func TestARQTimeout(t *testing.T) {
-	timeout := 5000
-	arq := NewSimpleARQWithMTU(1, func([]byte) {}, ARQ_MTU, timeout)
-
-	if !arq.HasTimeout() {
-		t.Fatal("ARQ should have timeout configured")
-	}
-
-	if arq.GetTimeout() != timeout {
-		t.Fatalf("Expected timeout %d, got %d", timeout, arq.GetTimeout())
-	}
-
-	// Test without timeout
-	arq2 := NewSimpleARQ(1, func([]byte) {})
-	if arq2.HasTimeout() {
-		t.Fatal("ARQ should not have timeout configured")
-	}
-}
-
 // TestARQEmptyInput tests handling of empty or invalid input
 func TestARQEmptyInput(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Empty input
 	arq.Input([]byte{})
@@ -530,7 +555,7 @@ func TestARQEmptyInput(t *testing.T) {
 
 // TestARQMultiplePacketsInInput tests parsing multiple packets in one Input call
 func TestARQMultiplePacketsInInput(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Create multiple packets in one buffer
 	pkt0 := makeARQDataPacket(0, []byte("pkt0"))

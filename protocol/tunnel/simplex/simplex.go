@@ -56,13 +56,11 @@ func (d *SimplexDialer) Dial(dst string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.meta["url"], err = core.NewURL(addr.String())
+	d.meta["url"], err = core.NewURL(core.SimplexTunnel + "+" + addr.String())
 	if err != nil {
 		return nil, err
 	}
 	d.meta["simplex_addr"] = addr
-	client.SetIsControlPacket(arq.SimpleARQChecker)
-
 	return arq.NewARQSessionWithConfig(client, addr, addr.ARQConfig()), nil
 }
 
@@ -81,11 +79,14 @@ func (l *SimplexListener) Listen(dst string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	server.SetIsControlPacket(arq.SimpleARQChecker)
 	l.server = server
 	addr := server.Addr()
 
-	u, err = core.NewURL(addr.String())
+	u, err = core.NewURL(core.SimplexTunnel + "+" + addr.String())
+	if err != nil {
+		server.Close()
+		return nil, err
+	}
 	l.meta["url"] = u
 	l.meta["simplex_addr"] = addr
 

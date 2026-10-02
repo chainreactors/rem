@@ -2,7 +2,6 @@ package simplex
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -54,7 +53,7 @@ func (m *mockStorageOps) ListFiles(folderPath string) ([]string, error) {
 	defer m.mu.Unlock()
 	// Treat folderPath as a directory: ensure trailing "/"
 	prefix := folderPath
-	if !strings.HasSuffix(prefix, "/") {
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 	var result []string
@@ -72,6 +71,34 @@ func (m *mockStorageOps) ListFiles(folderPath string) ([]string, error) {
 		}
 		seen[name] = true
 		result = append(result, name)
+	}
+	return result, nil
+}
+
+func (m *mockStorageOps) ListDirs(folderPath string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := folderPath
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	var result []string
+	seen := make(map[string]bool)
+	for path := range m.files {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		name := path[len(prefix):]
+		idx := strings.Index(name, "/")
+		if idx < 0 {
+			continue
+		}
+		dir := name[:idx+1]
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		result = append(result, dir)
 	}
 	return result, nil
 }
@@ -103,11 +130,23 @@ func (m *mockStorageOps) putFile(path string, data []byte) {
 	m.files[path] = append([]byte(nil), data...)
 }
 
+func waitNoFile(t *testing.T, mock *mockStorageOps, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !mock.hasFile(path) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s should have been deleted", path)
+}
+
 // failingStorageOps wraps mockStorageOps with controllable failures
 type failingStorageOps struct {
 	*mockStorageOps
-	mu            sync.Mutex
-	readFailCount int
+	mu             sync.Mutex
+	readFailCount  int
 	writeFailCount int
 }
 
@@ -176,6 +215,45 @@ func (m *recvFailStorageOps) ListFiles(prefix string) ([]string, error) {
 
 func (m *recvFailStorageOps) FileExists(path string) (bool, error) {
 	return m.mockStorageOps.FileExists(path)
+}
+
+type trackingStorageOps struct {
+	*mockStorageOps
+	mu         sync.Mutex
+	listCalls  int
+	readPaths  []string
+	deletePath []string
+}
+
+func newTrackingStorageOps() *trackingStorageOps {
+	return &trackingStorageOps{mockStorageOps: newMockStorageOps()}
+}
+
+func (m *trackingStorageOps) ReadFile(path string) ([]byte, error) {
+	m.mu.Lock()
+	m.readPaths = append(m.readPaths, path)
+	m.mu.Unlock()
+	return m.mockStorageOps.ReadFile(path)
+}
+
+func (m *trackingStorageOps) DeleteFile(path string) error {
+	m.mu.Lock()
+	m.deletePath = append(m.deletePath, path)
+	m.mu.Unlock()
+	return m.mockStorageOps.DeleteFile(path)
+}
+
+func (m *trackingStorageOps) ListFiles(prefix string) ([]string, error) {
+	m.mu.Lock()
+	m.listCalls++
+	m.mu.Unlock()
+	return m.mockStorageOps.ListFiles(prefix)
+}
+
+func (m *trackingStorageOps) stats() (int, []string, []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listCalls, append([]string(nil), m.readPaths...), append([]string(nil), m.deletePath...)
 }
 
 // ============================================================
@@ -382,13 +460,14 @@ func TestFileTransport_Server_Send(t *testing.T) {
 // Client Tests
 // ============================================================
 
-func TestFileTransport_Client_SendQueuesToPending(t *testing.T) {
+func TestFileTransport_Client_SendWritesFile(t *testing.T) {
+	mock := newMockStorageOps()
 	addr := testAddr()
 	cfg := testFileTransportConfig("[Test]")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ftc := NewFileTransportClient(nil, cfg, NewSimplexBuffer(addr), "s.txt", "r.txt", addr, ctx, cancel)
+	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr), "s.txt", "r.txt", addr, ctx, cancel)
 
 	data := []byte("send test")
 	pkts := NewSimplexPacketWithMaxSize(data, SimplexPacketTypeDATA, cfg.MaxBodySize)
@@ -400,12 +479,8 @@ func TestFileTransport_Client_SendQueuesToPending(t *testing.T) {
 	if n == 0 {
 		t.Error("expected non-zero bytes")
 	}
-
-	ftc.pendingMu.Lock()
-	hasPending := len(ftc.pendingData) > 0
-	ftc.pendingMu.Unlock()
-	if !hasPending {
-		t.Error("expected pendingData to be non-empty")
+	if !mock.hasFile("s.txt") {
+		t.Error("expected send file to be written")
 	}
 }
 
@@ -415,23 +490,17 @@ func TestFileTransport_Client_Monitoring_SendCycle(t *testing.T) {
 	addr := testAddr()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr),
 		"dir/test_send.txt", "dir/test_recv.txt", addr, ctx, cancel)
 
-	// Queue data
 	pkts := NewSimplexPacketWithMaxSize([]byte("monitoring test"), SimplexPacketTypeDATA, cfg.MaxBodySize)
-	ftc.Send(pkts, addr)
-
-	go ftc.monitoring()
-	defer cancel()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !mock.hasFile("dir/test_send.txt") && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	if _, err := ftc.Send(pkts, addr); err != nil {
+		t.Fatalf("Send error: %v", err)
 	}
 
 	if !mock.hasFile("dir/test_send.txt") {
-		t.Fatal("monitoring did not write send file")
+		t.Fatal("Send did not write send file")
 	}
 
 	content := mock.getFile("dir/test_send.txt")
@@ -444,36 +513,63 @@ func TestFileTransport_Client_Monitoring_SendCycle(t *testing.T) {
 	}
 }
 
+func TestFileTransport_Client_SinglePrioritizesControlBeforeData(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testFileTransportConfig("[ClientPriority]")
+	addr := testAddr()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sendFile := "dir/priority_send.txt"
+	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr),
+		sendFile, "dir/priority_recv.txt", addr, ctx, cancel)
+
+	// In inline I/O mode, each Send() writes immediately.
+	// Send CTRL first — it should write the file.
+	ctrlPkts := NewSimplexPackets()
+	ctrlPkts.Append(NewSimplexPacket(SimplexPacketTypeCTRL, []byte("window-update")))
+	if _, err := ftc.Send(ctrlPkts, addr); err != nil {
+		t.Fatalf("Send CTRL: %v", err)
+	}
+
+	if !mock.hasFile(sendFile) {
+		t.Fatal("Send did not write send file")
+	}
+
+	parsed, err := ParseSimplexPackets(mock.getFile(sendFile))
+	if err != nil {
+		t.Fatalf("ParseSimplexPackets: %v", err)
+	}
+	if len(parsed.Packets) != 1 {
+		t.Fatalf("packet count = %d, want 1", len(parsed.Packets))
+	}
+	if got := parsed.Packets[0]; got.PacketType != SimplexPacketTypeCTRL || string(got.Data) != "window-update" {
+		t.Fatalf("first uploaded packet = (%d,%q), want CTRL window-update", got.PacketType, string(got.Data))
+	}
+}
+
 func TestFileTransport_Client_Monitoring_RecvCycle(t *testing.T) {
 	mock := newMockStorageOps()
 	cfg := testFileTransportConfig("[Test]")
 	addr := testAddr()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	buffer := NewSimplexBuffer(addr)
 	ftc := NewFileTransportClient(mock, cfg, buffer,
 		"dir/test_send.txt", "dir/test_recv.txt", addr, ctx, cancel)
 
-	// Place recv file
 	recvData := []byte("response from server")
 	recvPkts := NewSimplexPacketWithMaxSize(recvData, SimplexPacketTypeDATA, cfg.MaxBodySize)
 	mock.putFile("dir/test_recv.txt", recvPkts.Marshal())
 
-	go ftc.monitoring()
-	defer cancel()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var pkt *SimplexPacket
-	for time.Now().Before(deadline) {
-		pkt, _ = buffer.GetPacket()
-		if pkt != nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	pkt, _, err := ftc.Receive()
+	if err != nil {
+		t.Fatalf("Receive error: %v", err)
 	}
-
 	if pkt == nil {
-		t.Fatal("monitoring did not process recv file")
+		t.Fatal("Receive did not return packet")
 	}
 	if string(pkt.Data) != "response from server" {
 		t.Errorf("got %q, want %q", string(pkt.Data), "response from server")
@@ -488,15 +584,13 @@ func TestFileTransport_Client_Monitoring_RecvCycle(t *testing.T) {
 // Zombie Fix Tests — verify all 3 zombie fixes work
 // ============================================================
 
-// TestFileTransport_Zombie_StaleSendFile verifies Fix #1:
-// Client sendFile exists (server dead), sendStallCount increments → cancel.
+// TestFileTransport_Zombie_StaleSendFile verifies that Send() returns an error
+// when the sendFile already exists (server not consuming).
 func TestFileTransport_Zombie_StaleSendFile(t *testing.T) {
 	mock := newMockStorageOps()
 	cfg := testFileTransportConfig("[Test]")
-	cfg.Interval = 20 * time.Millisecond
 	addr := testAddr()
 
-	// Pre-place send file (simulating dead server)
 	mock.putFile("dir/test_send.txt", []byte("old data"))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -504,18 +598,10 @@ func TestFileTransport_Zombie_StaleSendFile(t *testing.T) {
 	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr),
 		"dir/test_send.txt", "dir/test_recv.txt", addr, ctx, cancel)
 
-	// Queue new data
 	pkts := NewSimplexPacketWithMaxSize([]byte("new data"), SimplexPacketTypeDATA, cfg.MaxBodySize)
-	ftc.Send(pkts, addr)
-
-	go ftc.monitoring()
-
-	// sendStallCount should trigger cancel after ~10 ticks (200ms)
-	select {
-	case <-ctx.Done():
-		// Expected
-	case <-time.After(2 * time.Second):
-		t.Fatal("TIMEOUT: monitoring did not cancel ctx after stale sendFile")
+	_, err := ftc.Send(pkts, addr)
+	if err == nil {
+		t.Fatal("Send should return error when sendFile exists (stall)")
 	}
 }
 
@@ -578,8 +664,8 @@ func TestFileTransport_Zombie_PutBack(t *testing.T) {
 	t.Logf("Zombie #2 fixed: %d packets preserved in outBuffer", recovered)
 }
 
-// TestFileTransport_Zombie_RecvFailure verifies Fix #3:
-// Client recv PullFile fails with non-404 error → recvFailures → cancel.
+// TestFileTransport_Zombie_RecvFailure verifies that Receive() returns nil
+// when ReadFile fails with non-404 error (transient failure).
 func TestFileTransport_Zombie_RecvFailure(t *testing.T) {
 	baseMock := newMockStorageOps()
 	mock := &recvFailStorageOps{
@@ -588,7 +674,6 @@ func TestFileTransport_Zombie_RecvFailure(t *testing.T) {
 	}
 
 	cfg := testFileTransportConfig("[Test]")
-	cfg.Interval = 20 * time.Millisecond
 	addr := testAddr()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -596,20 +681,12 @@ func TestFileTransport_Zombie_RecvFailure(t *testing.T) {
 	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr),
 		"dir/test_send.txt", "dir/test_recv.txt", addr, ctx, cancel)
 
-	go ftc.monitoring()
-
-	// recvFailures should trigger cancel after ~10 ticks (200ms)
-	select {
-	case <-ctx.Done():
-		// Expected
-	case <-time.After(2 * time.Second):
-		t.Fatal("TIMEOUT: monitoring did not cancel ctx after persistent recv failures")
+	pkt, _, err := ftc.Receive()
+	if err != nil {
+		t.Fatalf("Receive should not return error for transient failures: %v", err)
 	}
-
-	// Verify the error is not os.ErrNotExist
-	_, err := mock.ReadFile("dir/test_recv.txt")
-	if errors.Is(err, os.ErrNotExist) {
-		t.Fatal("recvFailStorageOps should NOT return os.ErrNotExist")
+	if pkt != nil {
+		t.Fatal("Receive should return nil packet on failure")
 	}
 }
 
@@ -650,7 +727,7 @@ func TestFileTransport_Server_IdleCleanup(t *testing.T) {
 	}
 }
 
-// TestFileTransport_Client_ErrorPropagation verifies consecutive failures cancel context.
+// TestFileTransport_Client_ErrorPropagation verifies Send() returns error on write failure.
 func TestFileTransport_Client_ErrorPropagation(t *testing.T) {
 	mock := newFailingStorageOps()
 	mock.mu.Lock()
@@ -658,7 +735,6 @@ func TestFileTransport_Client_ErrorPropagation(t *testing.T) {
 	mock.mu.Unlock()
 
 	cfg := testFileTransportConfig("[Test]")
-	cfg.Interval = 10 * time.Millisecond
 	addr := testAddr()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -668,14 +744,635 @@ func TestFileTransport_Client_ErrorPropagation(t *testing.T) {
 		"dir/errprop_send.txt", "dir/errprop_recv.txt", addr, ctx, cancel)
 
 	pkts := NewSimplexPacketWithMaxSize([]byte("will fail"), SimplexPacketTypeDATA, cfg.MaxBodySize)
-	ftc.Send(pkts, addr)
+	_, err := ftc.Send(pkts, addr)
+	if err == nil {
+		t.Fatal("Send should return error when WriteFile fails")
+	}
+}
 
-	go ftc.monitoring()
+// ============================================================
+// Sequence Mode Tests
+// ============================================================
 
-	select {
-	case <-ctx.Done():
-		// Expected
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout: monitoring did not cancel context after persistent failures")
+func testSeqFileTransportConfig(logPrefix string) FileTransportConfig {
+	cfg := testFileTransportConfig(logPrefix)
+	cfg.SequenceMode = true
+	return cfg
+}
+
+func TestSeqFilename_Deterministic(t *testing.T) {
+	a := seqFilename("dir/", "cli1", "seed123", "s", 0)
+	b := seqFilename("dir/", "cli1", "seed123", "s", 0)
+	if a != b {
+		t.Fatalf("seqFilename not deterministic: %s != %s", a, b)
+	}
+
+	c := seqFilename("dir/", "cli1", "seed123", "s", 1)
+	if a == c {
+		t.Fatalf("different seq should give different filenames: %s == %s", a, c)
+	}
+
+	d := seqFilename("dir/", "cli1", "seed123", "r", 0)
+	if a == d {
+		t.Fatalf("different direction should give different filenames: %s == %s", a, d)
+	}
+
+	if !strings.HasPrefix(a, "dir/cli1.s.") {
+		t.Fatalf("expected prefix dir/cli1.s., got %s", a)
+	}
+
+	ref, ok := parseSeqFilename(strings.TrimPrefix(a, "dir/"), "seed123")
+	if !ok {
+		t.Fatalf("parseSeqFilename failed for %s", a)
+	}
+	if ref.clientID != "cli1" || ref.direction != "s" || ref.seq != 0 {
+		t.Fatalf("unexpected parsed seq file: %#v", ref)
+	}
+}
+
+func TestSeqMode_Server_ScanForNewClients(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+	addr.id = "testseed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := NewFileTransportServer(mock, "dir/", cfg, addr, ctx, cancel)
+
+	// Place sequenced files for two clients. Server sequence seed is its dir prefix.
+	seed := "dir/"
+	fname1 := seqFilename("dir/", "clientA", seed, "s", 0)
+	fname2 := seqFilename("dir/", "clientB", seed, "s", 0)
+	mock.putFile(fname1, []byte("dummy"))
+	mock.putFile(fname2, []byte("dummy"))
+
+	srv.scanForNewClients()
+
+	count := 0
+	srv.clients.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	if count != 2 {
+		t.Errorf("expected 2 clients, got %d", count)
+	}
+
+	// Re-scan should not duplicate
+	srv.scanForNewClients()
+	count2 := 0
+	srv.clients.Range(func(_, _ interface{}) bool {
+		count2++
+		return true
+	})
+	if count2 != 2 {
+		t.Errorf("repeated scan created duplicates, got %d", count2)
+	}
+}
+
+func TestSeqMode_Server_HandleClient_SendRecvCycle(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+
+	clientID := "seqcli"
+	seed := "test-seed-42"
+	clientAddr := generateAddrFromPath(clientID, addr)
+	state := &fileClientState{
+		inBuffer:     NewSimplexBuffer(clientAddr),
+		outBuffer:    NewSimplexBuffer(clientAddr),
+		addr:         clientAddr,
+		lastActivity: time.Now(),
+		seed:         seed,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := NewFileTransportServer(mock, "testdir/", cfg, addr, ctx, cancel)
+
+	// Simulate client uploading seq=0 and seq=1 send files
+	fname := seqFilename("testdir/", clientID, seed, "s", 0)
+	clientPkts := NewSimplexPacketWithMaxSize([]byte("seq payload 0"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	mock.putFile(fname, clientPkts.Marshal())
+
+	fname1 := seqFilename("testdir/", clientID, seed, "s", 1)
+	clientPkts1 := NewSimplexPacketWithMaxSize([]byte("seq payload 1"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	mock.putFile(fname1, clientPkts1.Marshal())
+
+	go srv.handleClient(ctx, clientID, state)
+
+	// Wait for both packets to arrive in inBuffer
+	deadline := time.Now().Add(2 * time.Second)
+	var received []string
+	for time.Now().Before(deadline) && len(received) < 2 {
+		pkt, _ := state.inBuffer.GetPacket()
+		if pkt != nil {
+			received = append(received, string(pkt.Data))
+		} else {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("expected 2 packets, got %d", len(received))
+	}
+	if received[0] != "seq payload 0" || received[1] != "seq payload 1" {
+		t.Errorf("unexpected payloads: %v", received)
+	}
+
+	// Verify send files were deleted
+	if mock.hasFile(fname) || mock.hasFile(fname1) {
+		t.Error("send files should be deleted after processing")
+	}
+
+	// Put data into outBuffer, verify handleClient writes sequenced recv file
+	serverPkt := NewSimplexPacket(SimplexPacketTypeDATA, []byte("seq response"))
+	state.outBuffer.PutPacket(serverPkt)
+
+	recvFname := seqFilename("testdir/", clientID, seed, "r", 0)
+	deadline = time.Now().Add(2 * time.Second)
+	for !mock.hasFile(recvFname) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !mock.hasFile(recvFname) {
+		t.Fatal("handleClient did not write sequenced recv file")
+	}
+
+	recvContent := mock.getFile(recvFname)
+	recvParsed, err := ParseSimplexPackets(recvContent)
+	if err != nil {
+		t.Fatalf("parse recv file error: %v", err)
+	}
+	if len(recvParsed.Packets) != 1 || string(recvParsed.Packets[0].Data) != "seq response" {
+		t.Errorf("unexpected recv file content")
+	}
+}
+
+func TestSeqMode_Server_UploadsControlBeforePendingDataBacklog(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqPriority]")
+	addr := testAddr()
+	clientID := "srvcli"
+	seed := "server-priority-seed"
+	clientAddr := generateAddrFromPath(clientID, addr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := NewFileTransportServer(mock, "dir/", cfg, addr, ctx, cancel)
+	state := &fileClientState{
+		inBuffer:  NewSimplexBuffer(clientAddr),
+		outBuffer: NewSimplexBuffer(clientAddr),
+		addr:      clientAddr,
+		seed:      seed,
+	}
+
+	for seq := 0; seq < seqMaxOpsPerTick; seq++ {
+		state.pendingWrites = append(state.pendingWrites, seqPendingFile{
+			seq:  seq,
+			data: NewSimplexPacketWithMaxSize([]byte(fmt.Sprintf("data-%d", seq)), SimplexPacketTypeDATA, cfg.MaxBodySize).Marshal(),
+		})
+	}
+	state.writeSeq = seqMaxOpsPerTick
+	if err := state.outBuffer.PutPacket(NewSimplexPacket(SimplexPacketTypeCTRL, []byte("window-update"))); err != nil {
+		t.Fatalf("PutPacket CTRL: %v", err)
+	}
+
+	if wrote := srv.writeSequenceFiles(clientID, state); wrote == 0 {
+		t.Fatal("writeSequenceFiles wrote no files")
+	}
+
+	ctrlFile := seqFilename("dir/", clientID, seed, "r", seqMaxOpsPerTick)
+	if !mock.hasFile(ctrlFile) {
+		t.Fatalf("CTRL seq file %s was not uploaded ahead of DATA backlog", ctrlFile)
+	}
+	parsed, err := ParseSimplexPackets(mock.getFile(ctrlFile))
+	if err != nil {
+		t.Fatalf("ParseSimplexPackets CTRL: %v", err)
+	}
+	if len(parsed.Packets) != 1 || parsed.Packets[0].PacketType != SimplexPacketTypeCTRL ||
+		string(parsed.Packets[0].Data) != "window-update" {
+		t.Fatalf("CTRL file content = %#v", parsed.Packets)
+	}
+}
+
+func TestSeqMode_Client_Monitoring_SendCycle(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+	seed := "client-seed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	buffer := NewSimplexBuffer(addr)
+	ftc := NewFileTransportClient(mock, cfg, buffer, "", "", addr, ctx, cancel)
+	ftc.prefix = "dir/"
+	ftc.clientID = "seqcli"
+	ftc.seed = seed
+
+	pkts := NewSimplexPacketWithMaxSize([]byte("seq send data"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	if _, err := ftc.Send(pkts, addr); err != nil {
+		t.Fatalf("Send error: %v", err)
+	}
+
+	expectedFile := seqFilename("dir/", "seqcli", seed, "s", 0)
+	if !mock.hasFile(expectedFile) {
+		t.Fatal("Send did not write sequenced send file")
+	}
+
+	content := mock.getFile(expectedFile)
+	parsed, err := ParseSimplexPackets(content)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(parsed.Packets) != 1 || string(parsed.Packets[0].Data) != "seq send data" {
+		t.Errorf("unexpected file content")
+	}
+}
+
+func TestSeqMode_Client_UploadsControlBeforePendingDataBacklog(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqPriority]")
+	addr := testAddr()
+	seed := "client-priority-seed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ftc := NewFileTransportClient(mock, cfg, NewSimplexBuffer(addr), "", "", addr, ctx, cancel)
+	ftc.prefix = "dir/"
+	ftc.clientID = "seqcli"
+	ftc.seed = seed
+
+	// Send a mixed packet batch with CTRL and DATA
+	mixed := NewSimplexPackets()
+	mixed.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("data-payload")))
+	mixed.Append(NewSimplexPacket(SimplexPacketTypeCTRL, []byte("window-update")))
+	if _, err := ftc.Send(mixed, addr); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// CTRL should be seq 0 (written first), DATA should be seq 1
+	ctrlFile := seqFilename("dir/", "seqcli", seed, "s", 0)
+	if !mock.hasFile(ctrlFile) {
+		t.Fatalf("CTRL seq file %s was not uploaded", ctrlFile)
+	}
+	parsed, err := ParseSimplexPackets(mock.getFile(ctrlFile))
+	if err != nil {
+		t.Fatalf("ParseSimplexPackets CTRL: %v", err)
+	}
+	if len(parsed.Packets) != 1 || parsed.Packets[0].PacketType != SimplexPacketTypeCTRL ||
+		string(parsed.Packets[0].Data) != "window-update" {
+		t.Fatalf("CTRL file content = %#v", parsed.Packets)
+	}
+}
+
+func TestSeqMode_Client_Monitoring_RecvCycle(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+	seed := "client-seed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	buffer := NewSimplexBuffer(addr)
+	ftc := NewFileTransportClient(mock, cfg, buffer, "", "", addr, ctx, cancel)
+	ftc.prefix = "dir/"
+	ftc.clientID = "seqcli"
+	ftc.seed = seed
+
+	recvFname := seqFilename("dir/", "seqcli", seed, "r", 0)
+	recvPkts := NewSimplexPacketWithMaxSize([]byte("seq response"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	mock.putFile(recvFname, recvPkts.Marshal())
+
+	pkt, _, err := ftc.Receive()
+	if err != nil {
+		t.Fatalf("Receive error: %v", err)
+	}
+	if pkt == nil {
+		t.Fatal("Receive did not return sequenced recv packet")
+	}
+	if string(pkt.Data) != "seq response" {
+		t.Errorf("got %q, want %q", string(pkt.Data), "seq response")
+	}
+
+	waitNoFile(t, mock, recvFname)
+}
+
+func TestSeqMode_Client_ReadsOutOfOrderControl(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+	seed := "ctrl-seed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	buffer := NewSimplexBuffer(addr)
+	ftc := NewFileTransportClient(mock, cfg, buffer, "", "", addr, ctx, cancel)
+	ftc.prefix = "dir/"
+	ftc.clientID = "seqcli"
+	ftc.seed = seed
+
+	ctrlPkts := NewSimplexPackets()
+	ctrlPkts.Append(NewSimplexPacket(SimplexPacketTypeCTRL, []byte("ack")))
+	ctrlFile := seqFilename("dir/", "seqcli", seed, "r", 1)
+	mock.putFile(ctrlFile, ctrlPkts.Marshal())
+
+	pkt, _, err := ftc.Receive()
+	if err != nil {
+		t.Fatalf("Receive CTRL: %v", err)
+	}
+	if pkt == nil || pkt.PacketType != SimplexPacketTypeCTRL || string(pkt.Data) != "ack" {
+		t.Fatalf("CTRL packet = %#v", pkt)
+	}
+	if ftc.recvSeq != 0 {
+		t.Fatalf("recvSeq advanced across missing data: got %d want 0", ftc.recvSeq)
+	}
+	if _, ok := ftc.recvSeen[1]; !ok {
+		t.Fatal("out-of-order CTRL seq should be marked seen")
+	}
+	waitNoFile(t, mock, ctrlFile)
+
+	dataFile := seqFilename("dir/", "seqcli", seed, "r", 0)
+	dataPkts := NewSimplexPacketWithMaxSize([]byte("data"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	mock.putFile(dataFile, dataPkts.Marshal())
+
+	pkt, _, err = ftc.Receive()
+	if err != nil {
+		t.Fatalf("Receive DATA: %v", err)
+	}
+	if pkt == nil || pkt.PacketType != SimplexPacketTypeDATA || string(pkt.Data) != "data" {
+		t.Fatalf("DATA packet = %#v", pkt)
+	}
+	if ftc.recvSeq != 2 {
+		t.Fatalf("recvSeq after filling gap = %d, want 2", ftc.recvSeq)
+	}
+}
+
+// TestSeqMode_ReadPathUsesListAsReadiness verifies that readSeqFilesParallel
+// uses LIST to discover available files (readiness check), only reads files
+// that exist, and skips gaps (seq 2 missing → seq 3 skipped as out-of-order DATA).
+func TestSeqMode_ReadPathUsesListAsReadiness(t *testing.T) {
+	ops := newTrackingStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqReadiness]")
+	addr := testAddr()
+	prefix := "dir/"
+	clientID := "seqcli"
+	seed := "readiness-seed"
+
+	existing := make(map[string]bool)
+	for _, seq := range []int{0, 1, 3} {
+		fname := seqFilename(prefix, clientID, seed, "r", seq)
+		pkts := NewSimplexPacketWithMaxSize([]byte(fmt.Sprintf("msg%d", seq)), SimplexPacketTypeDATA, cfg.MaxBodySize)
+		ops.putFile(fname, pkts.Marshal())
+		existing[fname] = true
+	}
+
+	baseSeq := 0
+	seen := make(map[int]bool)
+	buf := NewSimplexBuffer(addr)
+	processed := readSeqFilesParallel(ops, cfg.LogPrefix, prefix, clientID, seed, "r", &baseSeq, seen, buf)
+
+	if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
+	}
+	if baseSeq != 2 {
+		t.Fatalf("baseSeq = %d, want 2", baseSeq)
+	}
+
+	listCalls, readPaths, _ := ops.stats()
+	if listCalls != 1 {
+		t.Fatalf("ListFiles calls = %d, want 1", listCalls)
+	}
+	if len(readPaths) != 3 {
+		t.Fatalf("ReadFile calls = %d, want 3: %v", len(readPaths), readPaths)
+	}
+	missingPredicted := seqFilename(prefix, clientID, seed, "r", 2)
+	for _, path := range readPaths {
+		if !existing[path] {
+			t.Fatalf("read path %s was not returned by list", path)
+		}
+		if path == missingPredicted {
+			t.Fatalf("read missing predicted file %s", path)
+		}
+	}
+}
+
+// TestSeqMode_ReadPathBatchesListedFiles verifies that readSeqFilesParallel
+// respects seqMaxOpsPerTick and leaves remaining files for the next tick.
+func TestSeqMode_ReadPathBatchesListedFiles(t *testing.T) {
+	ops := newTrackingStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqBatch]")
+	addr := testAddr()
+	prefix := "dir/"
+	clientID := "seqcli"
+	seed := "batch-seed"
+
+	for seq := 0; seq < seqMaxOpsPerTick+1; seq++ {
+		fname := seqFilename(prefix, clientID, seed, "r", seq)
+		pkts := NewSimplexPacketWithMaxSize([]byte(fmt.Sprintf("msg%d", seq)), SimplexPacketTypeDATA, cfg.MaxBodySize)
+		ops.putFile(fname, pkts.Marshal())
+	}
+
+	baseSeq := 0
+	seen := make(map[int]bool)
+	buf := NewSimplexBuffer(addr)
+	processed := readSeqFilesParallel(ops, cfg.LogPrefix, prefix, clientID, seed, "r", &baseSeq, seen, buf)
+
+	if processed != seqMaxOpsPerTick {
+		t.Fatalf("processed = %d, want %d", processed, seqMaxOpsPerTick)
+	}
+	if baseSeq != seqMaxOpsPerTick {
+		t.Fatalf("baseSeq = %d, want %d", baseSeq, seqMaxOpsPerTick)
+	}
+	listCalls, readPaths, _ := ops.stats()
+	if listCalls != 1 {
+		t.Fatalf("ListFiles calls = %d, want 1", listCalls)
+	}
+	if len(readPaths) != seqMaxOpsPerTick {
+		t.Fatalf("ReadFile calls = %d, want %d: %v", len(readPaths), seqMaxOpsPerTick, readPaths)
+	}
+	if !ops.hasFile(seqFilename(prefix, clientID, seed, "r", seqMaxOpsPerTick)) {
+		t.Fatalf("seq %d should remain for next tick", seqMaxOpsPerTick)
+	}
+}
+
+func TestSeqMode_Client_StallDetection(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqTest]")
+	addr := testAddr()
+	seed := "stall-seed"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	buffer := NewSimplexBuffer(addr)
+	ftc := NewFileTransportClient(mock, cfg, buffer, "", "", addr, ctx, cancel)
+	ftc.prefix = "dir/"
+	ftc.clientID = "stallcli"
+	ftc.seed = seed
+
+	ftc.sendSeq = seqMaxPendingFiles + 1
+	ftc.highestUploadedSeq = seqMaxPendingFiles
+
+	oldFile := seqFilename("dir/", "stallcli", seed, "s", 1)
+	mock.putFile(oldFile, []byte("stale"))
+
+	pkts := NewSimplexPacketWithMaxSize([]byte("new data"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	_, err := ftc.Send(pkts, addr)
+	if err == nil {
+		t.Fatal("Send should return error when stall detected (old files lingering)")
+	}
+}
+
+func TestSeqMode_HandlerRestart_ResumesSeq(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqRestart]")
+	cfg.Interval = 20 * time.Millisecond
+	cfg.IdleMultiplier = 5 // 100ms idle timeout
+	addr := testAddr()
+
+	prefix := "restart/"
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	srv := NewFileTransportServer(mock, prefix, cfg, addr, srvCtx, srvCancel)
+
+	// Simulate client sending seq 0 and 1
+	seed := prefix
+	clientID := "restcli"
+	fname0 := seqFilename(prefix, clientID, seed, "s", 0)
+	fname1 := seqFilename(prefix, clientID, seed, "s", 1)
+	mock.putFile(fname0, NewSimplexPacketWithMaxSize([]byte("msg0"), SimplexPacketTypeDATA, cfg.MaxBodySize).Marshal())
+	mock.putFile(fname1, NewSimplexPacketWithMaxSize([]byte("msg1"), SimplexPacketTypeDATA, cfg.MaxBodySize).Marshal())
+
+	// Trigger first handler
+	srv.scanForNewClients()
+
+	// Drain inBuffer so handler can idle out
+	deadline := time.Now().Add(2 * time.Second)
+	drained := 0
+	for drained < 2 && time.Now().Before(deadline) {
+		if pkt, _, _ := srv.Receive(); pkt != nil {
+			drained++
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Wait for handler cleanup
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, exists := srv.clients.Load(clientID); !exists {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, exists := srv.clients.Load(clientID); exists {
+		t.Fatal("handler should have cleaned up after idle")
+	}
+
+	// Verify seq progress was saved
+	if _, ok := srv.seqState.Load(clientID); !ok {
+		t.Fatal("seqProgress should be saved after handler cleanup")
+	}
+
+	// Now client sends seq 2
+	fname2 := seqFilename(prefix, clientID, seed, "s", 2)
+	mock.putFile(fname2, NewSimplexPacketWithMaxSize([]byte("msg2"), SimplexPacketTypeDATA, cfg.MaxBodySize).Marshal())
+
+	// Trigger new handler — it should resume from readSeq=2
+	srv.scanForNewClients()
+
+	deadline = time.Now().Add(2 * time.Second)
+	var pkt *SimplexPacket
+	for time.Now().Before(deadline) {
+		pkt, _, _ = srv.Receive()
+		if pkt != nil && string(pkt.Data) == "msg2" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if pkt == nil || string(pkt.Data) != "msg2" {
+		t.Fatal("restarted handler did not resume at correct seq")
+	}
+}
+
+func TestSeqMode_EndToEnd_ClientServer(t *testing.T) {
+	mock := newMockStorageOps()
+	cfg := testSeqFileTransportConfig("[SeqE2E]")
+	cfg.Interval = 30 * time.Millisecond
+	addr := testAddr()
+
+	prefix := "e2e/"
+
+	// Start server
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	srv := NewFileTransportServer(mock, prefix, cfg, addr, srvCtx, srvCancel)
+	srv.StartPolling()
+
+	// Start client
+	clientID := "e2ecli"
+	cliCtx, cliCancel := context.WithCancel(context.Background())
+	defer cliCancel()
+	cliBuffer := NewSimplexBuffer(addr)
+	ftc := NewFileTransportClient(mock, cfg, cliBuffer, "", "", addr, cliCtx, cliCancel)
+	ftc.prefix = prefix
+	ftc.clientID = clientID
+	ftc.seed = prefix
+	ftc.StartMonitoring()
+
+	// Client sends data
+	clientPkts := NewSimplexPacketWithMaxSize([]byte("hello from client"), SimplexPacketTypeDATA, cfg.MaxBodySize)
+	ftc.Send(clientPkts, addr)
+
+	// Wait for server to discover client and process data
+	deadline := time.Now().Add(3 * time.Second)
+	var pkt *SimplexPacket
+	var pktAddr *SimplexAddr
+	for time.Now().Before(deadline) {
+		pkt, pktAddr, _ = srv.Receive()
+		if pkt != nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if pkt == nil {
+		t.Fatal("server did not receive client data")
+	}
+	if string(pkt.Data) != "hello from client" {
+		t.Errorf("got %q, want %q", string(pkt.Data), "hello from client")
+	}
+
+	// Server sends response back
+	serverPkts := &SimplexPackets{
+		Packets: []*SimplexPacket{NewSimplexPacket(SimplexPacketTypeDATA, []byte("hello from server"))},
+	}
+	_, err := srv.Send(serverPkts, pktAddr)
+	if err != nil {
+		t.Fatalf("server Send error: %v", err)
+	}
+
+	// Client should receive response
+	deadline = time.Now().Add(3 * time.Second)
+	var recvPkt *SimplexPacket
+	for time.Now().Before(deadline) {
+		recvPkt, _, _ = ftc.Receive()
+		if recvPkt != nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if recvPkt == nil {
+		t.Fatal("client did not receive server response")
+	}
+	if string(recvPkt.Data) != "hello from server" {
+		t.Errorf("got %q, want %q", string(recvPkt.Data), "hello from server")
 	}
 }

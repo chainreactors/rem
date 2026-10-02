@@ -528,12 +528,11 @@ func TestStreamHTTPH1TLSRoundTrip(t *testing.T) {
 	// Create server with h2 disabled.
 	serverCtx := context.WithValue(context.Background(), "meta", core.Metas{"mtu": core.MaxPacketSize})
 	serverLsn := streamhttp.NewStreamHTTPListener(serverCtx)
+	streamhttp.DisableHTTP2Listener(serverLsn)
 	lsn, err := serverLsn.Listen(addr)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	// Disable HTTP/2 on the server BEFORE connections arrive.
-	streamhttp.DisableHTTP2Listener(serverLsn)
 	t.Cleanup(func() { _ = lsn.Close() })
 
 	type acceptResult struct {

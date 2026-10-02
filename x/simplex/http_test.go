@@ -516,7 +516,7 @@ func httpConcurrentClients(t *testing.T, clientCount, msgsPerClient int) {
 	totalExpected := clientCount * msgsPerClient
 	t.Logf("%d clients x %d messages = %d total", clientCount, msgsPerClient, totalExpected)
 
-	// 并发接收（必须在发送前启动，否则 PeekableChannel(32) 溢出）
+	// 并发接收（必须在发送前启动，否则接收队列会填满）
 	var mu sync.Mutex
 	received := make(map[string]bool)
 	done := make(chan struct{})
@@ -593,7 +593,7 @@ func TestHTTP_Concurrent_BurstSend(t *testing.T) {
 	burstCount := 50
 	t.Logf("Burst sending %d messages", burstCount)
 
-	// 必须并发接收，否则 server 端 PeekableChannel(32) 会溢出
+	// 必须并发接收，否则 server 端接收队列会填满
 	var mu sync.Mutex
 	received := make(map[string]bool)
 	done := make(chan struct{})
@@ -691,7 +691,7 @@ func TestHTTP_DataIntegrity_SHA256(t *testing.T) {
 		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
 			data := make([]byte, size)
 			for i := range data {
-				data[i] = byte((i * 7 + 13) % 256)
+				data[i] = byte((i*7 + 13) % 256)
 			}
 			expectedHash := sha256.Sum256(data)
 

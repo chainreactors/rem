@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,16 +15,19 @@ import (
 )
 
 var (
-	DefaultSimplexInternal    = 100                   // 最大发包间隔(毫秒)
 	DefaultSimplexMinInternal = 10 * time.Millisecond // 最小发包间隔(毫秒)
 )
+
+type simplexTimeoutError struct{}
+
+func (e *simplexTimeoutError) Error() string   { return "timeout" }
+func (e *simplexTimeoutError) Timeout() bool   { return true }
+func (e *simplexTimeoutError) Temporary() bool { return true }
 
 const simplexQueueBackpressurePollInterval = time.Millisecond
 
 const (
-	DefaultItemsPerCycle = 4   // 每 tick 默认最大发送 item 数
-	DefaultSendQueueCap  = 512 // 数据包发送队列默认容量
-	DefaultCtrlQueueCap  = 64  // 控制包发送队列默认容量
+	DefaultItemsPerCycle = 4 // 每 tick 默认最大发送 item 数
 )
 
 // SimplexConfig 传输通道层配置，控制 Simplex 的发送行为和队列参数。
@@ -38,9 +40,6 @@ type SimplexConfig struct {
 	MaxBodySize   int           // 单个 item 的最大 raw 字节 (从传输层获取)
 	MaxPacketSize int           // 用户期望的最大包大小 (0=MaxBodySize*4, 自动推导 ItemsPerCycle)
 	ItemsPerCycle int           // 每 tick 最大发送 item 数 (通常由 MaxPacketSize 自动推导)
-	SendQueueCap  int           // 数据包发送队列容量 (0=512)
-	CtrlQueueCap  int           // 控制包发送队列容量 (0=64)
-	RecvQueueCap  int           // 接收队列容量 (0=自动按 MaxBodySize 调整)
 }
 
 // DataBudget returns the total bytes that can be queued for one tick
@@ -68,12 +67,6 @@ func (sc *SimplexConfig) Normalize() {
 	if sc.MaxPacketSize <= 0 && sc.MaxBodySize > 0 {
 		sc.MaxPacketSize = sc.MaxBodySize * sc.ItemsPerCycle
 	}
-	if sc.SendQueueCap <= 0 {
-		sc.SendQueueCap = DefaultSendQueueCap
-	}
-	if sc.CtrlQueueCap <= 0 {
-		sc.CtrlQueueCap = DefaultCtrlQueueCap
-	}
 }
 
 var defaultSimplexServerRecvChannelCapacity = 128
@@ -83,22 +76,6 @@ var simplexClientCreators = make(map[string]func(*SimplexAddr) (Simplex, error))
 type pendingSendBatch struct {
 	packets      *SimplexPackets
 	firstFailure time.Time
-}
-
-func isExpectedTransportShutdownError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "actively refused") ||
-		strings.Contains(msg, "use of closed network connection") ||
-		strings.Contains(msg, "server closed")
 }
 
 func isTerminalSimplexTransportError(err error) bool {
@@ -224,14 +201,7 @@ func NewSimplexClient(addr *SimplexAddr) (*SimplexClient, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 初始化 isCtrl 函数来识别控制包（NACK + standalone ACK + PUSH）
-	isCtrl := func(data []byte) bool {
-		if len(data) < 11 { // ARQ_OVERHEAD = 11
-			return false
-		}
-		cmd := data[0]
-		return cmd == 2 || cmd == 3 || cmd == 4 // CMD_NACK || CMD_ACK || CMD_PUSH
-	}
+	isCtrl := arq.SimpleARQChecker
 
 	client := &SimplexClient{
 		Simplex: sx,
@@ -241,8 +211,6 @@ func NewSimplexClient(addr *SimplexAddr) (*SimplexClient, error) {
 		isCtrl:  isCtrl,
 		failed:  make(chan struct{}),
 	}
-	sc := addr.SimplexConfig()
-	client.buf.EnableDataBudget(sc.DataBudget())
 	go client.polling()
 	return client, nil
 }
@@ -257,6 +225,8 @@ type SimplexClient struct {
 	closeOnce sync.Once
 	closeErr  error
 	failed    chan struct{}
+	rdNano    atomic.Int64
+	wdNano    atomic.Int64
 
 	transportFailOnce sync.Once
 	transportErr      atomic.Value
@@ -275,15 +245,37 @@ func (c *SimplexClient) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return 0, nil, io.ErrClosedPipe
 	default:
 	}
-	data, err := c.buf.RecvGet()
-	if err != nil || data == nil {
+
+	if data, err := c.buf.RecvGet(); err != nil {
 		if terr := c.transportFailure(); terr != nil {
 			return 0, nil, terr
 		}
-		select {
-		case <-c.ctx.Done():
+		return 0, c.Addr(), err
+	} else if data != nil {
+		return copy(p, data), c.Addr(), nil
+	}
+
+	waitCtx := c.ctx
+	if deadlineNano := c.rdNano.Load(); deadlineNano > 0 {
+		remaining := time.Until(time.Unix(0, deadlineNano))
+		if remaining <= 0 {
+			return 0, c.Addr(), &simplexTimeoutError{}
+		}
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(c.ctx, remaining)
+		defer cancel()
+	}
+
+	data, err := c.buf.RecvGetWait(waitCtx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, c.Addr(), &simplexTimeoutError{}
+		}
+		if terr := c.transportFailure(); terr != nil {
+			return 0, nil, terr
+		}
+		if errors.Is(err, context.Canceled) {
 			return 0, nil, io.ErrClosedPipe
-		default:
 		}
 		return 0, c.Addr(), err
 	}
@@ -313,36 +305,6 @@ func (c *SimplexClient) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 }
 
-func (c *SimplexClient) TryWriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if terr := c.transportFailure(); terr != nil {
-		return 0, terr
-	}
-	select {
-	case <-c.ctx.Done():
-		return 0, io.ErrClosedPipe
-	default:
-		var packetType SimplexPacketType
-		if c.isCtrl(p) {
-			packetType = SimplexPacketTypeCTRL
-		} else {
-			packetType = SimplexPacketTypeDATA
-		}
-		packet := NewSimplexPacketWithMaxSize(p, packetType, c.Addr().MaxBodySize())
-		ok, err := c.buf.TryPutPackets(packet)
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return 0, arq.ErrWouldBlock
-		}
-		return len(p), nil
-	}
-}
-
-func (c *SimplexClient) ARQWriteBudget() int {
-	return c.buf.DataBudget()
-}
-
 func (c *SimplexClient) LocalAddr() net.Addr {
 	return c.Addr()
 }
@@ -354,9 +316,30 @@ func (c *SimplexClient) Close() error {
 	return c.shutdown()
 }
 
-func (c *SimplexClient) SetDeadline(t time.Time) error      { return nil }
-func (c *SimplexClient) SetReadDeadline(t time.Time) error  { return nil }
-func (c *SimplexClient) SetWriteDeadline(t time.Time) error { return nil }
+func (c *SimplexClient) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func (c *SimplexClient) SetReadDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
+	c.rdNano.Store(nano)
+	return nil
+}
+
+func (c *SimplexClient) SetWriteDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
+	c.wdNano.Store(nano)
+	return nil
+}
 
 func (c *SimplexClient) shutdown() error {
 	c.closeOnce.Do(func() {
@@ -410,12 +393,14 @@ func (c *SimplexClient) polling() {
 			case <-c.failed:
 				return
 			case <-sendTicker.C:
-				// 检查 interval 是否被动态修改
-				if ni := c.Addr().Interval(); ni != sendInterval {
-					sendInterval = ni
-					sendTicker.Reset(ni)
-				}
-				stallTimeout = simplexAcceptanceStallTimeout(c.Addr())
+			}
+
+			// 检查 interval 是否被动态修改
+			if ni := c.Addr().Interval(); ni != sendInterval {
+				sendInterval = ni
+				sendTicker.Reset(ni)
+			}
+			stallTimeout = simplexAcceptanceStallTimeout(c.Addr())
 				// 优先发送控制包
 				if !pendingCtrl.ready() {
 					body, err := c.buf.GetControlPackets()
@@ -442,7 +427,6 @@ func (c *SimplexClient) polling() {
 						logs.Log.Warnf("simplex client ctrl send failed: %v", err)
 						continue
 					}
-					c.buf.MarkPacketsSent(pendingCtrl.packets)
 					pendingCtrl.clear()
 				}
 				// 取所有待发数据 (上限 DataBudget)，一次性交给 Send，内部按 maxBodySize 拆分成多 items
@@ -477,10 +461,8 @@ func (c *SimplexClient) polling() {
 						logs.Log.Warnf("simplex client send failed: %v", err)
 						continue
 					}
-					c.buf.MarkPacketsSent(pendingData.packets)
 					pendingData.clear()
 				}
-			}
 		}
 	}()
 
@@ -546,6 +528,8 @@ type SimplexServer struct {
 	disconnectMu sync.Mutex     // 保护 onDisconnect
 	closeOnce    sync.Once
 	closeErr     error
+	rdNano       atomic.Int64
+	wdNano       atomic.Int64
 }
 
 func (c *SimplexServer) SetIsControlPacket(f func([]byte) bool) {
@@ -619,7 +603,6 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 		return buf.(*SimplexBuffer)
 	}
 	sbuf := NewSimplexBuffer(addr)
-	sbuf.EnableDataBudget(addr.SimplexConfig().DataBudget())
 	c.buffers.Store(addr.ID(), sbuf)
 	go func() {
 		stallTimeout := simplexAcceptanceStallTimeout(addr)
@@ -633,6 +616,19 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 			}
 
 			stallTimeout = simplexAcceptanceStallTimeout(addr)
+			if !pendingCtrl.ready() && !pendingData.ready() {
+				if err := sbuf.WaitUntilQueued(c.ctx); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, io.ErrClosedPipe) {
+						if _, loaded := c.buffers.LoadAndDelete(addr.ID()); loaded {
+							c.emitPeerError(addr, io.ErrClosedPipe)
+						}
+						return
+					}
+					logs.Log.Warnf("simplex server wait queued failed for %s: %v", addr.ID(), err)
+					time.Sleep(DefaultSimplexMinInternal)
+					continue
+				}
+			}
 			if !pendingCtrl.ready() {
 				body, err := sbuf.GetControlPackets()
 				if err != nil {
@@ -651,10 +647,6 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 					}
 					return
 				}
-				if body.Size() == 0 {
-					time.Sleep(time.Millisecond)
-					continue
-				}
 				pendingData.set(body)
 			}
 
@@ -663,7 +655,6 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 				active = &pendingData
 			}
 			if !active.ready() {
-				time.Sleep(time.Millisecond)
 				continue
 			}
 
@@ -676,9 +667,7 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 					}
 					return
 				}
-				if isExpectedTransportShutdownError(err) {
-					logs.Log.Debugf("simplex server send stopping during transport shutdown for %s: %v", addr.ID(), err)
-				} else {
+				if !isTerminalSimplexTransportError(err) {
 					logs.Log.Warnf("simplex server send failed: %v", err)
 				}
 				active.markFailure(time.Now())
@@ -694,7 +683,6 @@ func (c *SimplexServer) GetBuffer(addr *SimplexAddr) *SimplexBuffer {
 				time.Sleep(DefaultSimplexMinInternal)
 				continue
 			}
-			sbuf.MarkPacketsSent(active.packets)
 			active.clear()
 		}
 	}()
@@ -712,7 +700,36 @@ func (c *SimplexServer) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		}
 		return copy(p, entry.data), entry.addr, nil
 	default:
-		return 0, nil, nil
+	}
+
+	if deadlineNano := c.rdNano.Load(); deadlineNano > 0 {
+		remaining := time.Until(time.Unix(0, deadlineNano))
+		if remaining <= 0 {
+			return 0, nil, &simplexTimeoutError{}
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-c.ctx.Done():
+			return 0, nil, io.ErrClosedPipe
+		case entry := <-c.recvCh:
+			if entry.err != nil {
+				return 0, entry.addr, entry.err
+			}
+			return copy(p, entry.data), entry.addr, nil
+		case <-timer.C:
+			return 0, nil, &simplexTimeoutError{}
+		}
+	}
+
+	select {
+	case <-c.ctx.Done():
+		return 0, nil, io.ErrClosedPipe
+	case entry := <-c.recvCh:
+		if entry.err != nil {
+			return 0, entry.addr, entry.err
+		}
+		return copy(p, entry.data), entry.addr, nil
 	}
 }
 
@@ -748,41 +765,6 @@ func (c *SimplexServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 }
 
-func (c *SimplexServer) TryWriteTo(p []byte, addr net.Addr) (n int, err error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, io.ErrClosedPipe
-	default:
-		a, ok := addr.(*SimplexAddr)
-		if !ok {
-			return 0, fmt.Errorf("invalid address type: %T", addr)
-		}
-
-		buf := c.GetBuffer(a)
-
-		var packetType SimplexPacketType
-		if c.isCtrl(p) {
-			packetType = SimplexPacketTypeCTRL
-		} else {
-			packetType = SimplexPacketTypeDATA
-		}
-
-		packet := NewSimplexPacketWithMaxSize(p, packetType, a.MaxBodySize())
-		accepted, err := buf.TryPutPackets(packet)
-		if err != nil {
-			return 0, err
-		}
-		if !accepted {
-			return 0, arq.ErrWouldBlock
-		}
-		return len(p), nil
-	}
-}
-
-func (c *SimplexServer) ARQWriteBudget() int {
-	return c.Addr().SimplexConfig().DataBudget()
-}
-
 func (c *SimplexServer) LocalAddr() net.Addr {
 	return c.Addr()
 }
@@ -806,9 +788,30 @@ func (c *SimplexServer) notifyDisconnect(addr net.Addr) {
 	}
 }
 
-func (c *SimplexServer) SetDeadline(t time.Time) error      { return nil }
-func (c *SimplexServer) SetReadDeadline(t time.Time) error  { return nil }
-func (c *SimplexServer) SetWriteDeadline(t time.Time) error { return nil }
+func (c *SimplexServer) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func (c *SimplexServer) SetReadDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
+	c.rdNano.Store(nano)
+	return nil
+}
+
+func (c *SimplexServer) SetWriteDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
+	c.wdNano.Store(nano)
+	return nil
+}
 
 func (c *SimplexServer) Close() error {
 	c.closeOnce.Do(func() {
@@ -840,18 +843,7 @@ func NewSimplexServer(network, address string) (*SimplexServer, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 导入 SimpleARQChecker 来检查控制包
-	// 该函数由 x/arq 包提供，用于识别 ARQ 协议的控制包（NACK）
-	var isCtrl func([]byte) bool
-
-	// SimpleARQChecker 识别 CMD_NACK / CMD_ACK / CMD_PUSH
-	isCtrl = func(data []byte) bool {
-		if len(data) < 11 { // ARQ_OVERHEAD = 11
-			return false
-		}
-		cmd := data[0]
-		return cmd == 2 || cmd == 3 || cmd == 4 // CMD_NACK || CMD_ACK || CMD_PUSH
-	}
+	isCtrl := arq.SimpleARQChecker
 
 	server := &SimplexServer{
 		Simplex: sx,

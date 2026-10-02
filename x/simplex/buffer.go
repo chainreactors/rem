@@ -6,58 +6,60 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chainreactors/rem/x/arq"
 	"github.com/chainreactors/rem/x/utils"
 )
 
-// SimplexBuffer 使用PeekableChannel存储发送数据包，ChannelBuffer存储接收数据包
+// SimplexBuffer stores outbound packets in priority queues and inbound packets
+// in a packet-boundary-preserving ChannelBuffer.
 type SimplexBuffer struct {
 	recvBuf *utils.ChannelBuffer // 接收：保持包边界的 packet buffer
 	addr    *SimplexAddr
 
 	closeOnce sync.Once
 
-	queueMu   sync.Mutex
-	closed    bool
-	ctrlQueue []*SimplexPacket
-	dataQueue []*SimplexPacket
-	ctrlCap   int
-	dataCap   int
-
-	creditMu    sync.Mutex
-	dataBudget  int
-	dataQueued  int
-	creditReady chan struct{}
+	queueMu    sync.Mutex
+	closed     bool
+	ctrlQueue  []*SimplexPacket
+	dataQueue  []*SimplexPacket
+	ctrlCap    int
+	dataCap    int
+	queueReady chan struct{}
 }
 
 var (
-	defaultSimplexCtrlChannelCapacity       = 64
-	defaultSimplexSendChannelCapacity       = 512
-	defaultSimplexRecvChannelCapacity       = 128
-	defaultSimplexRecvChannelLargePacketCap = 32
-	defaultSimplexRecvChannelHugePacketCap  = 16
+	defaultSimplexCtrlChannelCapacity = 64
+	defaultSimplexSendChannelCapacity = 512
+	defaultSimplexRecvChannelCapacity = 128
 )
 
 func NewSimplexBuffer(addr *SimplexAddr) *SimplexBuffer {
-	// 根据包大小动态调整接收通道容量：大包少 slot 控制内存
+	sendCap := defaultSimplexSendChannelCapacity
+	ctrlCap := defaultSimplexCtrlChannelCapacity
 	recvCap := defaultSimplexRecvChannelCapacity
-	if addr.maxBodySize > 256*1024 {
-		recvCap = defaultSimplexRecvChannelHugePacketCap // >256KB 包: 最多缓存 16 个 (如 4MB*16=64MB)
-	} else if addr.maxBodySize > 64*1024 {
-		recvCap = defaultSimplexRecvChannelLargePacketCap // >64KB 包: 最多缓存 32 个
+
+	if addr != nil {
+		wndSize := addr.ARQConfig().WndSize
+		if wndSize <= 0 {
+			wndSize = arq.ARQ_WND_SIZE
+		}
+		if c := wndSize * 4; c > sendCap {
+			sendCap = c
+		}
+		if c := wndSize; c > ctrlCap {
+			ctrlCap = c
+		}
+		if c := wndSize * 2; c > recvCap {
+			recvCap = c
+		}
 	}
 
-	// 发送通道容量需要容纳 ARQ 一个完整窗口的 segment 输出。
-	// ARQ flush() 每 10ms 可输出 WND_SIZE(128) 个 segment，
-	// 而 SimplexClient polling 每 interval(3s) 才消费一次。
-	// 容量太小会把上层长流量/多路复用流控一并卡住。
-	sendCap := defaultSimplexSendChannelCapacity
-
 	return &SimplexBuffer{
-		recvBuf:     utils.NewChannel(recvCap),
-		addr:        addr,
-		ctrlCap:     defaultSimplexCtrlChannelCapacity,
-		dataCap:     sendCap,
-		creditReady: make(chan struct{}, 1),
+		recvBuf:    utils.NewChannel(recvCap),
+		addr:       addr,
+		ctrlCap:    ctrlCap,
+		dataCap:    sendCap,
+		queueReady: make(chan struct{}, 1),
 	}
 }
 
@@ -75,99 +77,39 @@ func (b *SimplexBuffer) RecvGet() ([]byte, error) {
 	return b.recvBuf.Get()
 }
 
+func (b *SimplexBuffer) RecvGetWait(ctx context.Context) ([]byte, error) {
+	return b.recvBuf.GetWait(ctx)
+}
+
 // PutPacket: 按类型投放到不同通道
 func (b *SimplexBuffer) PutPacket(pkt *SimplexPacket) error {
 	_, err := b.putPacketWait(context.Background(), pkt)
 	return err
 }
 
-func (b *SimplexBuffer) TryPutPacket(pkt *SimplexPacket) (bool, error) {
-	return b.tryPutPacket(pkt)
-}
-
-func (b *SimplexBuffer) dataPacketBytes(pkt *SimplexPacket) int {
-	if pkt == nil || pkt.PacketType != SimplexPacketTypeDATA {
-		return 0
-	}
-	return pkt.Size()
-}
-
-func (b *SimplexBuffer) signalCreditReady() {
+func (b *SimplexBuffer) signalQueueReady() {
 	select {
-	case b.creditReady <- struct{}{}:
+	case b.queueReady <- struct{}{}:
 	default:
 	}
 }
 
-func (b *SimplexBuffer) waitReserveData(ctx context.Context, bytes int) error {
-	if bytes <= 0 || b.dataBudget <= 0 {
-		return nil
-	}
-	for {
-		b.creditMu.Lock()
-		if b.dataQueued+bytes <= b.dataBudget {
-			b.dataQueued += bytes
-			b.creditMu.Unlock()
-			return nil
-		}
-		b.creditMu.Unlock()
-
-		if ctx != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-b.creditReady:
-			case <-time.After(simplexQueueBackpressurePollInterval):
-			}
-		} else {
-			select {
-			case <-b.creditReady:
-			case <-time.After(simplexQueueBackpressurePollInterval):
-			}
-		}
-	}
-}
-
-func (b *SimplexBuffer) tryReserveData(bytes int) (bool, error) {
-	if bytes <= 0 || b.dataBudget <= 0 {
-		return true, nil
-	}
-	b.creditMu.Lock()
-	defer b.creditMu.Unlock()
-	if b.dataQueued+bytes > b.dataBudget {
-		return false, nil
-	}
-	b.dataQueued += bytes
-	return true, nil
-}
-
-func (b *SimplexBuffer) releaseData(bytes int) {
-	if bytes <= 0 {
-		return
-	}
-	b.creditMu.Lock()
-	b.dataQueued -= bytes
-	if b.dataQueued < 0 {
-		b.dataQueued = 0
-	}
-	b.creditMu.Unlock()
-	b.signalCreditReady()
+// SendReady returns a channel that is signaled when new packets are enqueued.
+// The send goroutine can select on this to wake up immediately instead of
+// waiting for the next polling tick.
+func (b *SimplexBuffer) SendReady() <-chan struct{} {
+	return b.queueReady
 }
 
 func (b *SimplexBuffer) putPacketWait(ctx context.Context, pkt *SimplexPacket) (bool, error) {
 	if pkt == nil {
 		return true, nil
 	}
-	bytes := b.dataPacketBytes(pkt)
-	if err := b.waitReserveData(ctx, bytes); err != nil {
-		return false, err
-	}
 
 	for {
 		b.queueMu.Lock()
 		if b.closed {
 			b.queueMu.Unlock()
-			b.releaseData(bytes)
 			return false, io.ErrClosedPipe
 		}
 		if b.enqueuePacketLocked(pkt) {
@@ -179,7 +121,6 @@ func (b *SimplexBuffer) putPacketWait(ctx context.Context, pkt *SimplexPacket) (
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				b.releaseData(bytes)
 				return false, ctx.Err()
 			case <-time.After(simplexQueueBackpressurePollInterval):
 			}
@@ -189,51 +130,6 @@ func (b *SimplexBuffer) putPacketWait(ctx context.Context, pkt *SimplexPacket) (
 	}
 }
 
-func (b *SimplexBuffer) tryPutPacket(pkt *SimplexPacket) (bool, error) {
-	if pkt == nil {
-		return true, nil
-	}
-	bytes := b.dataPacketBytes(pkt)
-	ok, err := b.tryReserveData(bytes)
-	if err != nil || !ok {
-		return ok, err
-	}
-
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-
-	if b.closed {
-		b.releaseData(bytes)
-		return false, io.ErrClosedPipe
-	}
-	if !b.enqueuePacketLocked(pkt) {
-		b.releaseData(bytes)
-		return false, nil
-	}
-	return true, nil
-}
-
-func (b *SimplexBuffer) PutPacketFront(pkt *SimplexPacket) error {
-	if pkt == nil {
-		return nil
-	}
-
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-
-	if b.closed {
-		return io.ErrClosedPipe
-	}
-
-	switch pkt.PacketType {
-	case SimplexPacketTypeCTRL:
-		b.ctrlQueue = append([]*SimplexPacket{pkt}, b.ctrlQueue...)
-	default:
-		b.dataQueue = append([]*SimplexPacket{pkt}, b.dataQueue...)
-	}
-	return nil
-}
-
 func (b *SimplexBuffer) PutPackets(packets *SimplexPackets) error {
 	for _, packet := range packets.Packets {
 		if _, err := b.putPacketWait(context.Background(), packet); err != nil {
@@ -241,101 +137,6 @@ func (b *SimplexBuffer) PutPackets(packets *SimplexPackets) error {
 		}
 	}
 	return nil
-}
-
-func (b *SimplexBuffer) TryPutPackets(packets *SimplexPackets) (bool, error) {
-	if packets == nil {
-		return true, nil
-	}
-
-	dataBytes := 0
-	ctrlCount := 0
-	dataCount := 0
-	for _, packet := range packets.Packets {
-		if packet == nil {
-			continue
-		}
-		dataBytes += b.dataPacketBytes(packet)
-		if packet.PacketType == SimplexPacketTypeCTRL {
-			ctrlCount++
-		} else {
-			dataCount++
-		}
-	}
-
-	ok, err := b.tryReserveData(dataBytes)
-	if err != nil || !ok {
-		return ok, err
-	}
-
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-
-	if b.closed {
-		b.releaseData(dataBytes)
-		return false, io.ErrClosedPipe
-	}
-	if len(b.ctrlQueue)+ctrlCount > b.ctrlCap || len(b.dataQueue)+dataCount > b.dataCap {
-		b.releaseData(dataBytes)
-		return false, nil
-	}
-
-	for _, packet := range packets.Packets {
-		if packet == nil {
-			continue
-		}
-		b.enqueuePacketLocked(packet)
-	}
-	return true, nil
-}
-
-func (b *SimplexBuffer) RequeuePacketsFront(packets *SimplexPackets) error {
-	if packets == nil {
-		return nil
-	}
-	for i := len(packets.Packets) - 1; i >= 0; i-- {
-		if err := b.PutPacketFront(packets.Packets[i]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (b *SimplexBuffer) HasQueuedControl() bool {
-	if b == nil {
-		return false
-	}
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-	return len(b.ctrlQueue) > 0
-}
-
-func (b *SimplexBuffer) DataBudget() int {
-	if b == nil {
-		return 0
-	}
-	return b.dataBudget
-}
-
-func (b *SimplexBuffer) EnableDataBudget(limit int) {
-	if b == nil {
-		return
-	}
-	b.creditMu.Lock()
-	b.dataBudget = limit
-	b.creditMu.Unlock()
-	b.signalCreditReady()
-}
-
-func (b *SimplexBuffer) MarkPacketsSent(packets *SimplexPackets) {
-	if packets == nil {
-		return
-	}
-	released := 0
-	for _, packet := range packets.Packets {
-		released += b.dataPacketBytes(packet)
-	}
-	b.releaseData(released)
 }
 
 // GetPacket: 优先从ctrlChannel取
@@ -359,22 +160,6 @@ func (b *SimplexBuffer) GetPacket() (*SimplexPacket, error) {
 	return nil, nil
 }
 
-func (b *SimplexBuffer) Peek() (*SimplexPacket, error) {
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-
-	if b.closed {
-		return nil, io.ErrClosedPipe
-	}
-	if len(b.ctrlQueue) > 0 {
-		return b.ctrlQueue[0], nil
-	}
-	if len(b.dataQueue) > 0 {
-		return b.dataQueue[0], nil
-	}
-	return nil, nil
-}
-
 func (b *SimplexBuffer) GetPackets() (*SimplexPackets, error) {
 	b.queueMu.Lock()
 	defer b.queueMu.Unlock()
@@ -387,6 +172,31 @@ func (b *SimplexBuffer) GetPackets() (*SimplexPackets, error) {
 	b.appendFromQueueLocked(&b.ctrlQueue, packets)
 	b.appendFromQueueLocked(&b.dataQueue, packets)
 	return packets, nil
+}
+
+func (b *SimplexBuffer) WaitUntilQueued(ctx context.Context) error {
+	for {
+		b.queueMu.Lock()
+		if b.closed {
+			b.queueMu.Unlock()
+			return io.ErrClosedPipe
+		}
+		if len(b.ctrlQueue) > 0 || len(b.dataQueue) > 0 {
+			b.queueMu.Unlock()
+			return nil
+		}
+		b.queueMu.Unlock()
+
+		if ctx == nil {
+			<-b.queueReady
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.queueReady:
+		}
+	}
 }
 
 func (b *SimplexBuffer) GetControlPackets() (*SimplexPackets, error) {
@@ -402,22 +212,9 @@ func (b *SimplexBuffer) GetControlPackets() (*SimplexPackets, error) {
 	return packets, nil
 }
 
-func (b *SimplexBuffer) GetDataPackets() (*SimplexPackets, error) {
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-
-	if b.closed {
-		return nil, io.ErrClosedPipe
-	}
-
-	packets := NewSimplexPackets()
-	b.appendFromQueueLocked(&b.dataQueue, packets)
-	return packets, nil
-}
-
-// GetAllDataPackets drains all queued data packets up to dataBudget bytes.
-// Unlike GetDataPackets (capped at maxBodySize per call), this returns the full
-// budget worth of data so the transport layer can split it into multiple items.
+// GetAllDataPackets drains all queued data packets up to the per-tick budget.
+// The budget is derived from SimplexConfig (MaxBodySize × ItemsPerCycle) and
+// limits how much data the transport layer sends per polling cycle.
 func (b *SimplexBuffer) GetAllDataPackets() (*SimplexPackets, error) {
 	b.queueMu.Lock()
 	defer b.queueMu.Unlock()
@@ -427,9 +224,11 @@ func (b *SimplexBuffer) GetAllDataPackets() (*SimplexPackets, error) {
 	}
 
 	packets := NewSimplexPackets()
-	budget := b.dataBudget
-	if budget <= 0 {
-		budget = b.addr.maxBodySize
+	budget := b.addr.maxBodySize
+	if b.addr != nil {
+		if sc := b.addr.SimplexConfig(); sc.DataBudget() > 0 {
+			budget = sc.DataBudget()
+		}
 	}
 	for len(b.dataQueue) > 0 {
 		pkt := b.dataQueue[0]
@@ -451,11 +250,8 @@ func (b *SimplexBuffer) Close() error {
 		b.ctrlQueue = nil
 		b.dataQueue = nil
 		b.queueMu.Unlock()
+		b.signalQueueReady()
 		b.recvBuf.Close()
-		b.creditMu.Lock()
-		b.dataQueued = 0
-		b.creditMu.Unlock()
-		b.signalCreditReady()
 	})
 	return nil
 }
@@ -485,6 +281,7 @@ func (b *SimplexBuffer) enqueuePacketLocked(pkt *SimplexPacket) bool {
 		}
 		b.dataQueue = append(b.dataQueue, pkt)
 	}
+	b.signalQueueReady()
 	return true
 }
 
@@ -505,6 +302,7 @@ type AsymBuffer struct {
 	readBuf    *SimplexBuffer // 接收数据的缓冲区
 	writeBuf   *SimplexBuffer // 发送数据的缓冲区
 	addr       *SimplexAddr   // 地址信息
+	activityMu sync.RWMutex
 	lastActive time.Time
 }
 
@@ -527,11 +325,15 @@ func (buf *AsymBuffer) Close() error {
 
 // Touch updates the last active timestamp.
 func (buf *AsymBuffer) Touch() {
+	buf.activityMu.Lock()
+	defer buf.activityMu.Unlock()
 	buf.lastActive = time.Now()
 }
 
 // LastActive returns the last active timestamp.
 func (buf *AsymBuffer) LastActive() time.Time {
+	buf.activityMu.RLock()
+	defer buf.activityMu.RUnlock()
 	return buf.lastActive
 }
 

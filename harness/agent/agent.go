@@ -4,9 +4,10 @@
 // The harness verifies traffic flows through the agent by connecting to an
 // echo HTTP server via the agent's dial function.
 //
-// Three levels:
+// Four levels:
 //
 //   - TestProxy: basic proxy correctness (GET, POST, large payload, concurrent)
+//   - TestMultiClient: one server serving multiple independent clients
 //   - TestResilience: server restart, client restart, network outage, idle resume
 //   - TestStress: burst traffic, large payloads
 //
@@ -51,6 +52,28 @@ type Env struct {
 // MakeEnv creates an agent environment. The Dial function must be ready.
 type MakeEnv func(t *testing.T) (env *Env, stop func(), err error)
 
+// ClientEnv is one client-side proxy attached to a shared agent server.
+type ClientEnv struct {
+	Env
+	Name string
+}
+
+// MultiClientEnv represents a single server with multiple connected clients.
+type MultiClientEnv struct {
+	Clients []ClientEnv
+}
+
+// MakeMultiClientEnv creates one server and clientCount clients connected to it.
+type MakeMultiClientEnv func(t *testing.T, clientCount int) (env *MultiClientEnv, stop func(), err error)
+
+// MultiClientOptions tunes TestMultiClient. Zero values select conservative defaults.
+type MultiClientOptions struct {
+	Clients           int
+	RequestsPerClient int
+	PayloadSize       int
+	RequestTimeout    time.Duration
+}
+
 // ControllableEnv extends Env with lifecycle controls for resilience testing.
 type ControllableEnv struct {
 	Env
@@ -74,6 +97,176 @@ func SOCKS5Dial(socksAddr string) Dial {
 		}
 		return dialer.Dial(network, addr)
 	}
+}
+
+// TestAll runs the standard agent proxy and stress harness suites.
+func TestAll(t *testing.T, makeEnv MakeEnv) {
+	t.Helper()
+	TestProxy(t, makeEnv)
+	TestStress(t, makeEnv)
+}
+
+// TestProxyWithMultiClient runs proxy correctness plus the shared-server
+// multi-client suite.
+func TestProxyWithMultiClient(t *testing.T, makeEnv MakeEnv, makeMultiEnv MakeMultiClientEnv) {
+	t.Helper()
+	TestProxy(t, makeEnv)
+	TestMultiClient(t, makeMultiEnv)
+}
+
+// TestAllWithMultiClient runs the standard suites plus the shared-server
+// multi-client suite.
+func TestAllWithMultiClient(t *testing.T, makeEnv MakeEnv, makeMultiEnv MakeMultiClientEnv) {
+	t.Helper()
+	TestAll(t, makeEnv)
+	TestMultiClient(t, makeMultiEnv)
+}
+
+// ── TestMultiClient: 单 server 多 client ─────────────────────
+
+// TestMultiClient verifies one server can serve multiple independent clients.
+func TestMultiClient(t *testing.T, makeEnv MakeMultiClientEnv) {
+	t.Helper()
+	TestMultiClientWithOptions(t, makeEnv, MultiClientOptions{})
+}
+
+// TestMultiClientWithOptions verifies one server can serve multiple independent
+// clients with caller-provided scale parameters.
+func TestMultiClientWithOptions(t *testing.T, makeEnv MakeMultiClientEnv, opts MultiClientOptions) {
+	t.Helper()
+	opts = normalizeMultiClientOptions(opts)
+	echoServer := startEchoServer(t)
+
+	env, stop, err := makeEnv(t, opts.Clients)
+	if err != nil {
+		t.Fatalf("MakeMultiClientEnv: %v", err)
+	}
+	defer stop()
+	validateMultiClientEnv(t, env, opts.Clients)
+
+	t.Run("MultiClient_BasicHTTP", func(t *testing.T) {
+		for i := range env.Clients {
+			clientEnv := env.Clients[i]
+			client := envHTTPClient(&clientEnv.Env)
+			client.Timeout = opts.RequestTimeout
+			path := fmt.Sprintf("/hello?client=%d", i)
+			resp, err := client.Get(echoServer.URL + path)
+			if err != nil {
+				t.Fatalf("%s GET: %v", clientName(clientEnv, i), err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s status %d, body: %s", clientName(clientEnv, i), resp.StatusCode, body)
+			}
+			if !bytes.Contains(body, []byte(path)) {
+				t.Fatalf("%s response routed incorrectly: %q", clientName(clientEnv, i), body)
+			}
+		}
+	})
+
+	t.Run("MultiClient_ConcurrentHTTP", func(t *testing.T) {
+		var wg sync.WaitGroup
+		var success, failures atomic.Int32
+		for i := range env.Clients {
+			clientEnv := env.Clients[i]
+			for r := 0; r < opts.RequestsPerClient; r++ {
+				wg.Add(1)
+				go func(idx, req int, ce ClientEnv) {
+					defer wg.Done()
+					client := envHTTPClient(&ce.Env)
+					client.Timeout = opts.RequestTimeout
+					path := fmt.Sprintf("/hello?client=%d&req=%d", idx, req)
+					resp, err := client.Get(echoServer.URL + path)
+					if err != nil {
+						t.Logf("%s req %d: %v", clientName(ce, idx), req, err)
+						failures.Add(1)
+						return
+					}
+					body, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(path)) {
+						t.Logf("%s req %d: bad response status=%d body=%q", clientName(ce, idx), req, resp.StatusCode, body)
+						failures.Add(1)
+						return
+					}
+					success.Add(1)
+				}(i, r, clientEnv)
+			}
+		}
+		wg.Wait()
+
+		want := int32(opts.Clients * opts.RequestsPerClient)
+		if success.Load() != want {
+			t.Fatalf("multi-client concurrent: %d/%d success, %d failures", success.Load(), want, failures.Load())
+		}
+	})
+
+	t.Run("MultiClient_PayloadIntegrity", func(t *testing.T) {
+		wantHash := fmt.Sprintf("%x", sha256.Sum256(makePayload(opts.PayloadSize)))
+		for i := range env.Clients {
+			clientEnv := env.Clients[i]
+			client := envHTTPClient(&clientEnv.Env)
+			client.Timeout = opts.RequestTimeout
+			resp, err := client.Get(fmt.Sprintf("%s/data?size=%d", echoServer.URL, opts.PayloadSize))
+			if err != nil {
+				t.Fatalf("%s data GET: %v", clientName(clientEnv, i), err)
+			}
+			h := sha256.New()
+			n, copyErr := io.Copy(h, resp.Body)
+			resp.Body.Close()
+			if copyErr != nil {
+				t.Fatalf("%s data read: %v", clientName(clientEnv, i), copyErr)
+			}
+			if int(n) != opts.PayloadSize {
+				t.Fatalf("%s data size: got %d, want %d", clientName(clientEnv, i), n, opts.PayloadSize)
+			}
+			if gotHash := fmt.Sprintf("%x", h.Sum(nil)); gotHash != wantHash {
+				t.Fatalf("%s SHA256 mismatch", clientName(clientEnv, i))
+			}
+		}
+	})
+}
+
+func normalizeMultiClientOptions(opts MultiClientOptions) MultiClientOptions {
+	if opts.Clients <= 0 {
+		opts.Clients = 3
+	}
+	if opts.Clients < 2 {
+		opts.Clients = 2
+	}
+	if opts.RequestsPerClient <= 0 {
+		opts.RequestsPerClient = 2
+	}
+	if opts.PayloadSize <= 0 {
+		opts.PayloadSize = 64 * 1024
+	}
+	if opts.RequestTimeout <= 0 {
+		opts.RequestTimeout = 2 * time.Minute
+	}
+	return opts
+}
+
+func validateMultiClientEnv(t *testing.T, env *MultiClientEnv, want int) {
+	t.Helper()
+	if env == nil {
+		t.Fatal("MakeMultiClientEnv returned nil env")
+	}
+	if len(env.Clients) != want {
+		t.Fatalf("client count: got %d, want %d", len(env.Clients), want)
+	}
+	for i, c := range env.Clients {
+		if c.Dial == nil {
+			t.Fatalf("client %d has nil Dial", i)
+		}
+	}
+}
+
+func clientName(c ClientEnv, fallback int) string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return fmt.Sprintf("client-%d", fallback)
 }
 
 // ── TestProxy: 基本代理正确性 ────────────────────────────────

@@ -97,11 +97,11 @@ type CaseSpec struct {
 }
 
 type Fixture struct {
-	t          *testing.T
-	helperTest string
-	vars       Vars
-	env        Vars
-	processes  map[string]*processHandle
+	t            *testing.T
+	helperTest   string
+	vars         Vars
+	env          Vars
+	processes    map[string]*processHandle
 	processSpecs map[string]ProcessSpec
 }
 
@@ -152,11 +152,11 @@ func StartFixture(t *testing.T, spec FixtureSpec) *Fixture {
 	}
 
 	fx := &Fixture{
-		t:          t,
-		helperTest: helperTest,
-		vars:       spec.Vars.Clone(),
-		env:        spec.Env.Clone(),
-		processes:  make(map[string]*processHandle, len(spec.Processes)),
+		t:            t,
+		helperTest:   helperTest,
+		vars:         spec.Vars.Clone(),
+		env:          spec.Env.Clone(),
+		processes:    make(map[string]*processHandle, len(spec.Processes)),
 		processSpecs: make(map[string]ProcessSpec, len(spec.Processes)),
 	}
 	for _, procSpec := range spec.Processes {

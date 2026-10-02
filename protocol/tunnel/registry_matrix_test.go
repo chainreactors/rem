@@ -15,6 +15,7 @@ import (
 	_ "github.com/chainreactors/rem/protocol/tunnel/streamhttp"
 	_ "github.com/chainreactors/rem/protocol/tunnel/tcp"
 	_ "github.com/chainreactors/rem/protocol/tunnel/udp"
+	_ "github.com/chainreactors/rem/protocol/tunnel/unix"
 	_ "github.com/chainreactors/rem/protocol/tunnel/websocket"
 
 	"github.com/chainreactors/rem/protocol/core"
@@ -31,6 +32,7 @@ func TestRegisteredTunnelDialersConstruct(t *testing.T) {
 		{rawURL: "http2+raw://127.0.0.1:8443/rem?wrapper=raw", tunnelName: core.HTTP2Tunnel},
 		{rawURL: "streamhttp+raw://127.0.0.1:8080/rem?wrapper=raw", tunnelName: core.StreamHTTPTunnel},
 		{rawURL: "websocket+raw://127.0.0.1:8080/rem?wrapper=raw", tunnelName: core.WebSocketTunnel},
+		{rawURL: "unix+raw://127.0.0.1:0/rem?pipe=rem-test&wrapper=raw", tunnelName: core.UNIXTunnel},
 		{rawURL: "memory+socks://alice:secret@rem-pipe?wrapper=raw", tunnelName: core.MemoryTunnel},
 		{rawURL: "dns+raw://127.0.0.1:5353/rem?domain=test.local&wrapper=raw", tunnelName: core.DNSTunnel},
 		{rawURL: "icmp+raw://127.0.0.1:0/rem?wrapper=raw", tunnelName: core.ICMPTunnel},
@@ -61,6 +63,7 @@ func TestRegisteredTunnelListenersConstruct(t *testing.T) {
 		{rawURL: "http2+raw://127.0.0.1:8443/rem?wrapper=raw", tunnelName: core.HTTP2Tunnel},
 		{rawURL: "streamhttp+raw://127.0.0.1:8080/rem?wrapper=raw", tunnelName: core.StreamHTTPTunnel},
 		{rawURL: "websocket+raw://127.0.0.1:8080/rem?wrapper=raw", tunnelName: core.WebSocketTunnel},
+		{rawURL: "unix+raw://127.0.0.1:0/rem?pipe=rem-test&wrapper=raw", tunnelName: core.UNIXTunnel},
 		{rawURL: "memory+socks://alice:secret@rem-pipe?wrapper=raw", tunnelName: core.MemoryTunnel},
 		{rawURL: "dns+raw://127.0.0.1:5353/rem?domain=test.local&wrapper=raw", tunnelName: core.DNSTunnel},
 		{rawURL: "icmp+raw://127.0.0.1:0/rem?wrapper=raw", tunnelName: core.ICMPTunnel},

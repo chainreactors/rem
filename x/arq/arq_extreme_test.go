@@ -49,7 +49,7 @@ func newBidirectionalNetwork(oneWayDelay time.Duration) *bidirectionalNetwork {
 	}
 
 	// 节点 A: 输出到 queueAtoB
-	net.nodeA = NewSimpleARQ(1, func(data []byte) {
+	net.nodeA = NewSimpleARQ(func(data []byte) {
 		net.mu.Lock()
 		defer net.mu.Unlock()
 
@@ -82,7 +82,7 @@ func newBidirectionalNetwork(oneWayDelay time.Duration) *bidirectionalNetwork {
 	})
 
 	// 节点 B: 输出到 queueBtoA
-	net.nodeB = NewSimpleARQ(1, func(data []byte) {
+	net.nodeB = NewSimpleARQ(func(data []byte) {
 		net.mu.Lock()
 		defer net.mu.Unlock()
 
@@ -506,7 +506,7 @@ func TestExtreme_ReceiverRestart(t *testing.T) {
 	// 注意: 新接收端 rcv_nxt=0, 但发送端 snd_nxt 已经是 5
 	net.mu.Lock()
 	oldOutput := net.nodeB.output
-	net.nodeB = NewSimpleARQWithOutput(1, oldOutput)
+	net.nodeB = NewSimpleARQWithOutput(oldOutput)
 	net.mu.Unlock()
 
 	t.Logf("=== 接收端重启 (rcv_nxt=0) ===")
@@ -564,7 +564,7 @@ func TestExtreme_ReceiverRestart_SenderProcessAckZero(t *testing.T) {
 	var outputData [][]byte
 	var mu sync.Mutex
 
-	arq := NewSimpleARQ(1, func(data []byte) {
+	arq := NewSimpleARQ(func(data []byte) {
 		mu.Lock()
 		d := make([]byte, len(data))
 		copy(d, data)
@@ -716,7 +716,7 @@ func TestExtreme_TotalPacketLoss(t *testing.T) {
 // TestExtreme_TotalLossExceedsRetryBudgetFailsSession verifies that ARQ fails
 // explicitly once a segment exceeds its retransmission budget.
 func TestExtreme_TotalLossExceedsRetryBudgetFailsSession(t *testing.T) {
-	arq := NewARQWithConfig(1, func([]byte) {}, ARQConfig{
+	arq := NewARQWithConfig(func([]byte) {}, ARQConfig{
 		MTU:                ARQ_MTU,
 		RTO:                20,
 		MaxRetransmissions: 2,
@@ -1197,8 +1197,8 @@ func runSimulatedARQTransfer(t *testing.T, interval, oneWayDelay time.Duration, 
 		cfg.RTO = 1
 	}
 
-	sender := NewARQWithConfig(1, link.enqueueA, cfg)
-	receiver := NewARQWithConfig(1, link.enqueueB, cfg)
+	sender := NewARQWithConfig(link.enqueueA, cfg)
+	receiver := NewARQWithConfig(link.enqueueB, cfg)
 
 	payload := make([]byte, size)
 	for i := range payload {

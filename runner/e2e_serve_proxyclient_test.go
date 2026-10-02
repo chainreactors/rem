@@ -160,10 +160,10 @@ func buildSSServeFixture(t *testing.T) runner.FixtureSpec {
 				Name:    "client",
 				Mode:    "console_run",
 				Command: "-c tcp://{{server_addr}}/?wrapper=raw -l ss://0.0.0.0:{{ss_port}}/?password=" + proxyclientTestPassword + " -a {{alias}} --debug",
-				Wait: []runner.ReadySpec{
-					{Kind: runner.ReadyTCPListen, Target: "{{ss_addr}}", Timeout: 15 * time.Second},
-					{Kind: runner.ReadyDelayOnly, Timeout: 2 * time.Second},
-				},
+				// A raw TCP readiness probe is not protocol-neutral here: it creates
+				// an invalid Shadowsocks bridge. Let the real protocol connection be
+				// the first accepted connection instead.
+				Wait: []runner.ReadySpec{{Kind: runner.ReadyDelayOnly, Timeout: 2 * time.Second}},
 			},
 		},
 	}
@@ -196,10 +196,9 @@ func buildTrojanServeFixture(t *testing.T) runner.FixtureSpec {
 				Name:    "client",
 				Mode:    "console_run",
 				Command: "-c tcp://{{server_addr}}/?wrapper=raw -l trojan://0.0.0.0:{{trojan_port}}/?password=" + proxyclientTestPassword + " -a {{alias}} --debug",
-				Wait: []runner.ReadySpec{
-					{Kind: runner.ReadyTCPListen, Target: "{{trojan_addr}}", Timeout: 15 * time.Second},
-					{Kind: runner.ReadyDelayOnly, Timeout: 2 * time.Second},
-				},
+				// A raw TCP readiness probe consumes a Trojan connection and can race
+				// with bridge cleanup. Delay startup without touching the protocol port.
+				Wait: []runner.ReadySpec{{Kind: runner.ReadyDelayOnly, Timeout: 2 * time.Second}},
 			},
 		},
 	}
@@ -377,9 +376,18 @@ func dialSS(t *testing.T, ssAddr, targetAddr, password string) net.Conn {
 		t.Fatalf("PickCipher: %v", err)
 	}
 
-	conn, err := net.DialTimeout("tcp", ssAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial SS %s: %v", ssAddr, err)
+	deadline := time.Now().Add(15 * time.Second)
+	var conn net.Conn
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, lastErr = net.DialTimeout("tcp", ssAddr, time.Second)
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatalf("dial SS %s: %v", ssAddr, lastErr)
 	}
 
 	sc := ciph.StreamConn(conn)
@@ -415,14 +423,23 @@ func ssEchoRoundtrip(t *testing.T, ssAddr, echoAddr, password string, msg []byte
 func dialTrojan(t *testing.T, trojanAddr, targetAddr, password string) net.Conn {
 	t.Helper()
 
-	tlsConn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: 5 * time.Second},
-		"tcp",
-		trojanAddr,
-		&tls.Config{InsecureSkipVerify: true},
-	)
-	if err != nil {
-		t.Fatalf("TLS dial %s: %v", trojanAddr, err)
+	deadline := time.Now().Add(15 * time.Second)
+	var tlsConn *tls.Conn
+	var lastErr error
+	for time.Now().Before(deadline) {
+		tlsConn, lastErr = tls.DialWithDialer(
+			&net.Dialer{Timeout: time.Second},
+			"tcp",
+			trojanAddr,
+			&tls.Config{InsecureSkipVerify: true},
+		)
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if tlsConn == nil {
+		t.Fatalf("TLS dial %s: %v", trojanAddr, lastErr)
 	}
 
 	host, portStr, err := net.SplitHostPort(targetAddr)

@@ -1,5 +1,3 @@
-//go:build !tinygo
-
 package main
 
 import "github.com/chainreactors/rem/protocol/core"

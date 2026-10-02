@@ -11,7 +11,6 @@ type SimplexPacketType uint8
 const (
 	SimplexPacketTypeCTRL SimplexPacketType = 0x96 // 控制包
 	SimplexPacketTypeDATA SimplexPacketType = 0x36 // 数据包
-	SimplexPacketTypeRST  SimplexPacketType = 0xFE // server 重启通知
 )
 
 // SimplexPacket 定义单个数据包结构体
@@ -118,24 +117,6 @@ func NewSimplexPacketWithMaxSize(data []byte, t SimplexPacketType, maxSize int) 
 
 func (sps *SimplexPackets) Append(pkt *SimplexPacket) {
 	sps.Packets = append(sps.Packets, pkt)
-}
-
-// HasControlPacket reports whether the batch contains any CTRL packet.
-func (sps *SimplexPackets) HasControlPacket() bool {
-	if sps == nil {
-		return false
-	}
-	for _, pkt := range sps.Packets {
-		if pkt != nil && pkt.PacketType == SimplexPacketTypeCTRL {
-			return true
-		}
-	}
-	return false
-}
-
-// IsDataOnly reports whether the batch is non-empty and contains no CTRL packet.
-func (sps *SimplexPackets) IsDataOnly() bool {
-	return sps != nil && len(sps.Packets) > 0 && !sps.HasControlPacket()
 }
 
 // Size 返回序列化后的大小

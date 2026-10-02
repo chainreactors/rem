@@ -267,7 +267,6 @@ func (r *RunnerConfig) runConnHubClient() error {
 
 		if err := a.HandlerInit(); err != nil {
 			a.Close(err)
-			agent.Agents.Delete(a.ID)
 			consecutiveDialFailures++
 			if r.Retry > 0 && consecutiveDialFailures > r.Retry {
 				utils.Log.Errorf("[connhub] %d consecutive failures, giving up", consecutiveDialFailures)

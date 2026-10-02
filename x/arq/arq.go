@@ -27,17 +27,14 @@ import (
 
 var nowFunc = time.Now
 
-// ErrWouldBlock indicates the send buffer is full and the caller should retry later.
-var ErrWouldBlock = errors.New("arq: would block")
-
 // SimpleARQChecker 简单ARQ协议的包类型判断（默认）。
-// NACK / standalone ACK / PUSH 都走 CTRL 通道优先发送，避免窗口释放被数据队列阻塞。
+// NACK / standalone ACK / FIN 都走 CTRL 通道优先发送，避免窗口释放和关闭信号被数据队列阻塞。
 func SimpleARQChecker(data []byte) bool {
 	if len(data) < ARQ_OVERHEAD {
 		return false
 	}
 	cmd := data[0]
-	return cmd == CMD_NACK || cmd == CMD_ACK || cmd == CMD_PUSH
+	return cmd == CMD_NACK || cmd == CMD_ACK || cmd == CMD_FIN
 }
 
 // 包类型常量
@@ -45,32 +42,70 @@ const (
 	CMD_DATA = 1
 	CMD_NACK = 2 // 负确认，要求重传特定包
 	CMD_ACK  = 3 // 独立 ACK 包
-	CMD_PUSH = 4 // 优先数据：不走 snd_queue/snd_buf，直接发送，不受 backpressure 影响
+	CMD_FIN  = 5 // 有序关闭标记：走可靠序列号，用于向对端传递 EOF
 )
 
-// 配置常量 (用作默认值)
+// Protocol constants — fixed by the wire format, not configurable.
 const (
-	ARQ_OVERHEAD       = 11                     // 包头大小: 1+4+4+2 (cmd+sn+ack+len)
-	ARQ_MTU            = 1400                   // 最大传输单元
-	ARQ_MSS            = ARQ_MTU - ARQ_OVERHEAD // 最大段大小
-	ARQ_MAX_PAYLOAD    = 0xFFFF                 // len 字段是 uint16，单 segment payload 不能超过 65535
-	ARQ_MAX_MTU        = ARQ_OVERHEAD + ARQ_MAX_PAYLOAD
-	ARQ_WND_SIZE       = 128  // 窗口大小（匹配 cloud storage 190KB/POST 容量）
-	ARQ_RTO            = 6000 // 重传超时时间(ms)
-	ARQ_INTERVAL       = 100  // 更新间隔(ms)
-	ARQ_NACK_THRESHOLD = 1    // 触发NACK的丢包阈值 (降为1，适配低频场景)
-	ARQ_MAX_RETRANS    = 3    // 单个 segment 最大重传次数（不含首次发送）
+	ARQ_OVERHEAD    = 11                             // 包头: cmd(1) + sn(4) + ack(4) + len(2)
+	ARQ_MAX_PAYLOAD = 0xFFFF                         // len field is uint16
+	ARQ_MAX_MTU     = ARQ_OVERHEAD + ARQ_MAX_PAYLOAD // 65546
 )
 
-// ARQConfig holds per-instance configuration for ARQ.
-// Zero values mean "use default".
+// Defaults — used when ARQConfig fields are zero.
+const (
+	ARQ_MTU         = 1400
+	ARQ_WND_SIZE    = 128
+	ARQ_RTO         = 6000 // ms
+	ARQ_MAX_RETRANS = 3
+)
+
+// ARQConfig holds per-instance configuration.
+// Zero values mean "use default". StandaloneAckSegments is auto-derived
+// from WndSize if not set.
 type ARQConfig struct {
-	MTU                   int // 0 = default (1400)
-	WndSize               int // 发送窗口大小 (0 = default 128)
-	Timeout               int // ms, 0 = no timeout
-	RTO                   int // ms, 0 = default (6000) - retransmission interval, NACK interval, standalone ACK timer
-	StandaloneAckSegments int // 0 = default (WndSize/2)
-	MaxRetransmissions    int // 0 = default (3); exceeded budget fails the session
+	MTU                   int // 0 = ARQ_MTU (1400)
+	WndSize               int // 0 = ARQ_WND_SIZE (128)
+	RTO                   int // ms, 0 = ARQ_RTO (6000)
+	MaxRetransmissions    int // 0 = ARQ_MAX_RETRANS (3)
+	StandaloneAckSegments int // 0 = WndSize/2 (auto)
+}
+
+// Presets for common transport profiles.
+
+// HighLatencyConfig is tuned for cloud-storage polling channels
+// (cloud storage, Azure Blob, OSS) with 1-10s intervals and high API latency.
+func HighLatencyConfig(mtu, rtoMs int) ARQConfig {
+	return ARQConfig{
+		MTU:                mtu,
+		RTO:                rtoMs,
+		MaxRetransmissions: 6,
+	}
+}
+
+// LowLatencyConfig is tuned for fast transports (HTTP, DNS, memory)
+// with <100ms intervals.
+func LowLatencyConfig(mtu int) ARQConfig {
+	return ARQConfig{
+		MTU: mtu,
+		RTO: 1000,
+	}
+}
+
+type ARQStats struct {
+	SndQueue   int
+	SndBuf     int
+	SndPending int
+	SndBytes   int
+	RcvQueue   int
+	RcvBuf     int
+	SndNxt     uint32
+	SndUna     uint32
+	RcvNxt     uint32
+	WndSize    int
+	MTU        int
+	RTO        int
+	Err        error
 }
 
 // Segment 数据段
@@ -104,14 +139,12 @@ func (e *DeliveryFailureError) Unwrap() error {
 
 // ARQ 简化的ARQ实现
 type ARQ struct {
-	mu   sync.Mutex // 保护所有状态的并发访问
-	conv uint32     // 会话ID
+	mu sync.Mutex // 保护所有状态的并发访问
 
 	// 可配置参数
 	mtu                int // 最大传输单元
 	mss                int // 最大段大小 (mtu - overhead)
 	wnd_size           int // 发送窗口大小
-	timeout            int // 默认超时时间(ms)，0表示无超时
 	rto                int // 重传超时(ms) - retransmission, NACK interval, standalone ACK timer
 	maxRetransmissions int
 
@@ -125,15 +158,12 @@ type ARQ struct {
 	snd_bytes   int                // snd_queue 中待发送的 payload 字节数
 	snd_pending []byte             // 不足 MSS 的尾部暂存，下次 Queue 时合并
 	snd_buf     []Segment          // 发送缓冲区(等待确认或超时)
-	rcv_buf   map[uint32]Segment // 接收缓冲区(乱序包)
-	rcv_queue []byte             // 接收队列(有序数据)
+	rcv_buf     map[uint32]Segment // 接收缓冲区(乱序包)
+	rcv_queue   []byte             // 接收队列(有序数据)
 
 	// 接收端状态跟踪
 	highest_rcv uint32 // 接收到的最高序列号
-	nack_count  int    // 连续gap计数
-	nack_sent   uint32 // 最后发送NACK的时间
-	nack_retry  int    // NACK重试次数
-	nack_gap_ts uint32 // 首次检测到 gap 的时间戳 (用于时间触发)
+	nack_sent uint32 // 最后发送NACK的时间
 
 	// 时间相关
 	current               uint32 // 当前时间
@@ -141,8 +171,8 @@ type ARQ struct {
 	rcv_since_ack         uint32 // 自上次 ACK 后接收到的 segment 数量
 	standaloneAckSegments uint32 // standalone ACK 计数触发阈值（按 segment 数）
 
-	// 旁路信道 (CMD_PUSH)
-	push_queue [][]byte // 接收到的 CMD_PUSH 数据，独立于 rcv_queue
+	finQueued    bool // local FIN has been queued in the reliable stream
+	remoteClosed bool // peer FIN has been delivered in-order
 
 	// 输出函数
 	output func([]byte)
@@ -152,26 +182,25 @@ type ARQ struct {
 }
 
 // NewSimpleARQ 创建新的ARQ实例
-func NewSimpleARQ(conv uint32, output func([]byte)) *ARQ {
-	return NewSimpleARQWithMTU(conv, output, ARQ_MTU, 0)
+func NewSimpleARQ(output func([]byte)) *ARQ {
+	return NewSimpleARQWithMTU(output, ARQ_MTU)
 }
 
 // NewSimpleARQWithOutput creates an ARQ instance, preserving the output function reference
 // for cases where the caller needs to swap the output (e.g., receiver restart tests).
-func NewSimpleARQWithOutput(conv uint32, output func([]byte)) *ARQ {
-	return NewARQWithConfig(conv, output, ARQConfig{})
+func NewSimpleARQWithOutput(output func([]byte)) *ARQ {
+	return NewARQWithConfig(output, ARQConfig{})
 }
 
-// NewSimpleARQWithMTU 创建新的ARQ实例，支持自定义MTU和超时
-func NewSimpleARQWithMTU(conv uint32, output func([]byte), mtu int, timeout int) *ARQ {
-	return NewARQWithConfig(conv, output, ARQConfig{
-		MTU:     mtu,
-		Timeout: timeout,
+// NewSimpleARQWithMTU 创建新的ARQ实例，支持自定义MTU。
+func NewSimpleARQWithMTU(output func([]byte), mtu int) *ARQ {
+	return NewARQWithConfig(output, ARQConfig{
+		MTU: mtu,
 	})
 }
 
 // NewARQWithConfig 创建新的ARQ实例，支持完整配置
-func NewARQWithConfig(conv uint32, output func([]byte), cfg ARQConfig) *ARQ {
+func NewARQWithConfig(output func([]byte), cfg ARQConfig) *ARQ {
 	if cfg.MTU <= ARQ_OVERHEAD {
 		cfg.MTU = ARQ_MTU
 	}
@@ -192,11 +221,9 @@ func NewARQWithConfig(conv uint32, output func([]byte), cfg ARQConfig) *ARQ {
 	}
 
 	arq := &ARQ{
-		conv:                  conv,
 		mtu:                   cfg.MTU,
 		mss:                   cfg.MTU - ARQ_OVERHEAD,
 		wnd_size:              cfg.WndSize,
-		timeout:               cfg.Timeout,
 		rto:                   cfg.RTO,
 		maxRetransmissions:    cfg.MaxRetransmissions,
 		standaloneAckSegments: uint32(cfg.StandaloneAckSegments),
@@ -273,6 +300,33 @@ func (arq *ARQ) flushPendingLocked() {
 	arq.snd_pending = nil
 }
 
+func (arq *ARQ) queueFINIfNeeded(localWrote bool) (bool, error) {
+	arq.mu.Lock()
+	defer arq.mu.Unlock()
+	if arq.err != nil {
+		return false, arq.err
+	}
+	if arq.finQueued {
+		return false, nil
+	}
+
+	hasPendingSend := len(arq.snd_pending) > 0 || len(arq.snd_queue) > 0 || len(arq.snd_buf) > 0
+	needsFIN := hasPendingSend || (!arq.remoteClosed && localWrote)
+	if !needsFIN {
+		return false, nil
+	}
+
+	arq.flushPendingLocked()
+	seg := Segment{
+		cmd: CMD_FIN,
+		sn:  arq.snd_nxt,
+	}
+	arq.snd_queue = append(arq.snd_queue, seg)
+	arq.snd_nxt++
+	arq.finQueued = true
+	return true, nil
+}
+
 // Queue 发送数据，支持自动分片，并在 ARQ 已失败时返回 error。
 func (arq *ARQ) Queue(data []byte) error {
 	arq.mu.Lock()
@@ -327,7 +381,13 @@ func (arq *ARQ) Input(data []byte) {
 
 		switch cmd {
 		case CMD_DATA:
-			arq.handleData(sn, data[:length])
+			arq.handleReliableSegment(cmd, sn, data[:length])
+			arq.processAck(ack)
+		case CMD_FIN:
+			if length != 0 {
+				break
+			}
+			arq.handleReliableSegment(cmd, sn, nil)
 			arq.processAck(ack)
 		case CMD_NACK:
 			// 批量 NACK: sn 是第一个缺失 SN, payload 是后续缺失 SN 列表
@@ -335,20 +395,14 @@ func (arq *ARQ) Input(data []byte) {
 			arq.processAck(ack)
 		case CMD_ACK:
 			arq.processAck(ack)
-		case CMD_PUSH:
-			// 旁路信道：直接入 push_queue，不经过 rcv_buf/rcv_queue
-			pushData := make([]byte, length)
-			copy(pushData, data[:length])
-			arq.push_queue = append(arq.push_queue, pushData)
-			arq.processAck(ack) // 捎带的 ACK 仍然处理
 		}
 
 		data = data[length:]
 	}
 }
 
-// handleData 处理数据包
-func (arq *ARQ) handleData(sn uint32, data []byte) {
+// handleReliableSegment 处理有序可靠流中的 DATA/FIN segment。
+func (arq *ARQ) handleReliableSegment(cmd uint8, sn uint32, data []byte) {
 	// 更新接收到的最高序列号
 	if sn > arq.highest_rcv {
 		arq.highest_rcv = sn
@@ -356,7 +410,10 @@ func (arq *ARQ) handleData(sn uint32, data []byte) {
 
 	// 检查序列号
 	if sn < arq.rcv_nxt {
-		// 重复包，丢弃
+		// 重复包，丢弃并立即 ACK，帮助对端在 ACK 丢失后尽快释放窗口或完成 Close。
+		arq.sendStandaloneAck()
+		arq.rcv_since_ack = 0
+		arq.last_ack_sent = arq.current
 		return
 	}
 
@@ -365,26 +422,33 @@ func (arq *ARQ) handleData(sn uint32, data []byte) {
 
 	if sn == arq.rcv_nxt {
 		// 按序到达
-		arq.rcv_queue = append(arq.rcv_queue, data...)
+		finDelivered := arq.deliverReliableSegment(Segment{cmd: cmd, sn: sn, data: data})
 		arq.rcv_nxt++
-		arq.nack_count = 0 // 重置gap计数
-		arq.nack_retry = 0 // 重置NACK重试计数
-		arq.nack_gap_ts = 0
 
 		// 检查缓冲区中的连续包
 		for {
 			if seg, exists := arq.rcv_buf[arq.rcv_nxt]; exists {
-				arq.rcv_queue = append(arq.rcv_queue, seg.data...)
+				if arq.deliverReliableSegment(seg) {
+					finDelivered = true
+				}
 				delete(arq.rcv_buf, arq.rcv_nxt)
 				arq.rcv_nxt++
 			} else {
 				break
 			}
 		}
+		if finDelivered {
+			arq.sendStandaloneAck()
+			arq.rcv_since_ack = 0
+			arq.last_ack_sent = arq.current
+			return
+		}
 	} else {
 		// 乱序到达，存入缓冲区
 		seg := Segment{
+			cmd:  cmd,
 			sn:   sn,
+			len:  uint16(len(data)),
 			data: make([]byte, len(data)),
 		}
 		copy(seg.data, data)
@@ -401,6 +465,17 @@ func (arq *ARQ) handleData(sn uint32, data []byte) {
 		arq.rcv_since_ack = 0
 		arq.last_ack_sent = arq.current
 	}
+}
+
+func (arq *ARQ) deliverReliableSegment(seg Segment) bool {
+	switch seg.cmd {
+	case CMD_DATA:
+		arq.rcv_queue = append(arq.rcv_queue, seg.data...)
+	case CMD_FIN:
+		arq.remoteClosed = true
+		return true
+	}
+	return false
 }
 
 // processAck 处理捎带 ACK，清理 snd_buf 中已确认的段
@@ -427,7 +502,6 @@ func (arq *ARQ) processAck(ack uint32) {
 
 // checkAndSendNack 检查并发送批量 NACK
 func (arq *ARQ) checkAndSendNack() {
-	// 收集 rcv_nxt 到 highest_rcv 之间所有缺失的 SN
 	var missing []uint32
 	for sn := arq.rcv_nxt; sn < arq.highest_rcv; sn++ {
 		if _, exists := arq.rcv_buf[sn]; !exists {
@@ -436,42 +510,17 @@ func (arq *ARQ) checkAndSendNack() {
 	}
 
 	if len(missing) == 0 {
-		arq.nack_retry = 0
-		arq.nack_gap_ts = 0
 		return
 	}
 
-	// 记录首次检测到 gap 的时间
-	if arq.nack_gap_ts == 0 {
-		arq.nack_gap_ts = arq.current
+	nackInterval := uint32(arq.rto / 4)
+	if nackInterval < 1 {
+		nackInterval = 1
 	}
-
-	// 条件1: gap_count >= 阈值 (降为1)
-	// 条件2: gap 存在超过 2*RTO (覆盖低频场景)
-	gapThresholdMet := len(missing) >= ARQ_NACK_THRESHOLD
-	timeThresholdMet := arq.nack_gap_ts > 0 && arq.current-arq.nack_gap_ts > uint32(2*arq.rto)
-
-	if !gapThresholdMet && !timeThresholdMet {
-		return
-	}
-
-	// 计算NACK重传间隔，使用指数退避
-	nack_interval := uint32(100 * (1 << min(arq.nack_retry, 5))) // 最大3.2秒
-
-	// 检查是否需要重传NACK
-	if arq.current-arq.nack_sent > nack_interval {
+	if arq.current-arq.nack_sent > nackInterval {
 		arq.sendBatchNack(missing)
 		arq.nack_sent = arq.current
-		arq.nack_retry++
 	}
-}
-
-// min 辅助函数
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // handleBatchNack 处理批量 NACK 包
@@ -535,12 +584,14 @@ func (arq *ARQ) Update() {
 
 // flush 刷新数据
 func (arq *ARQ) flush() {
-	// 如果 snd_queue 为空但有 pending 碎片，推入队列（避免尾部数据无限等待）
-	if len(arq.snd_queue) == 0 && len(arq.snd_pending) > 0 {
-		arq.flushPendingLocked()
-	}
 	// 移动队列中的包到发送缓冲区（首次发送）
-	for len(arq.snd_queue) > 0 && len(arq.snd_buf) < arq.wnd_size {
+	for len(arq.snd_buf) < arq.wnd_size {
+		if len(arq.snd_queue) == 0 {
+			if len(arq.snd_pending) == 0 {
+				break
+			}
+			arq.flushPendingLocked()
+		}
 		seg := arq.snd_queue[0]
 		arq.snd_queue = arq.snd_queue[1:]
 		arq.snd_bytes -= len(seg.data)
@@ -592,56 +643,6 @@ func (arq *ARQ) sendStandaloneAck() {
 	arq.output(buf)
 }
 
-func (arq *ARQ) queuePushLocked(data []byte) error {
-	if arq.err != nil {
-		return arq.err
-	}
-
-	buf := make([]byte, ARQ_OVERHEAD+len(data))
-	buf[0] = CMD_PUSH
-	binary.BigEndian.PutUint32(buf[1:5], 0)           // sn=0 (无序号)
-	binary.BigEndian.PutUint32(buf[5:9], arq.rcv_nxt) // 捎带 ACK
-	binary.BigEndian.PutUint16(buf[9:11], uint16(len(data)))
-	copy(buf[ARQ_OVERHEAD:], data)
-	arq.output(buf)
-	return nil
-}
-
-// QueuePush 通过旁路信道发送优先数据（CMD_PUSH）。
-// 不经过 snd_queue/snd_buf，直接发送 — 不受 backpressure 和窗口限制。
-// 捎带 ACK 帮助释放发送方窗口。不可靠（无重传），适用于 keepalive ping/pong。
-func (arq *ARQ) QueuePush(data []byte) error {
-	arq.mu.Lock()
-	defer arq.mu.Unlock()
-	return arq.queuePushLocked(data)
-}
-
-// SendPush 保持兼容：忽略 error 的旧调用仍可工作。
-func (arq *ARQ) SendPush(data []byte) {
-	_ = arq.QueuePush(data)
-}
-
-// RecvPush 接收旁路信道的数据（CMD_PUSH）。
-// 返回最早一条 push 数据；无数据时返回 nil。
-func (arq *ARQ) RecvPush() []byte {
-	arq.mu.Lock()
-	defer arq.mu.Unlock()
-
-	if len(arq.push_queue) == 0 {
-		return nil
-	}
-	data := arq.push_queue[0]
-	arq.push_queue = arq.push_queue[1:]
-	return data
-}
-
-// HasPush 返回 push_queue 是否有待读取数据。
-func (arq *ARQ) HasPush() bool {
-	arq.mu.Lock()
-	defer arq.mu.Unlock()
-	return len(arq.push_queue) > 0
-}
-
 // sendSegment 发送数据段 (11 字节头)
 func (arq *ARQ) sendSegment(seg *Segment) {
 	buf := make([]byte, ARQ_OVERHEAD+len(seg.data))
@@ -657,7 +658,17 @@ func (arq *ARQ) sendSegment(seg *Segment) {
 func (arq *ARQ) WaitSnd() int {
 	arq.mu.Lock()
 	defer arq.mu.Unlock()
-	return len(arq.snd_queue) + len(arq.snd_buf)
+	n := len(arq.snd_queue) + len(arq.snd_buf)
+	if len(arq.snd_pending) > 0 {
+		n++
+	}
+	return n
+}
+
+func (arq *ARQ) remoteDone() bool {
+	arq.mu.Lock()
+	defer arq.mu.Unlock()
+	return arq.remoteClosed
 }
 
 // WaitBuf 返回 in-flight 的包数量（仅 snd_buf，不含 snd_queue）。
@@ -675,6 +686,26 @@ func (arq *ARQ) Err() error {
 	return arq.err
 }
 
+func (arq *ARQ) Stats() ARQStats {
+	arq.mu.Lock()
+	defer arq.mu.Unlock()
+	return ARQStats{
+		SndQueue:   len(arq.snd_queue),
+		SndBuf:     len(arq.snd_buf),
+		SndPending: len(arq.snd_pending),
+		SndBytes:   arq.snd_bytes,
+		RcvQueue:   len(arq.rcv_queue),
+		RcvBuf:     len(arq.rcv_buf),
+		SndNxt:     arq.snd_nxt,
+		SndUna:     arq.snd_una,
+		RcvNxt:     arq.rcv_nxt,
+		WndSize:    arq.wnd_size,
+		MTU:        arq.mtu,
+		RTO:        arq.rto,
+		Err:        arq.err,
+	}
+}
+
 func (arq *ARQ) fail(err error) {
 	if arq.err == nil {
 		arq.err = err
@@ -686,14 +717,4 @@ func (arq *ARQ) WaitRcv() int {
 	arq.mu.Lock()
 	defer arq.mu.Unlock()
 	return len(arq.rcv_buf)
-}
-
-// HasTimeout 返回是否设置了超时
-func (arq *ARQ) HasTimeout() bool {
-	return arq.timeout > 0
-}
-
-// GetTimeout 返回配置的超时时间（毫秒）
-func (arq *ARQ) GetTimeout() int {
-	return arq.timeout
 }

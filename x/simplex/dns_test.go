@@ -49,6 +49,23 @@ func testDNSServer(domain string) *DNSServer {
 	}
 }
 
+func testDNSServerFromURL(t *testing.T, rawURL string) *DNSServer {
+	t.Helper()
+	addr, err := ResolveDNSAddr("dns", rawURL)
+	if err != nil {
+		t.Fatalf("ResolveDNSAddr error: %v", err)
+	}
+	config := getDNSConfig(addr)
+	ctx, cancel := context.WithCancel(context.Background())
+	return &DNSServer{
+		addr:            addr,
+		domain:          config.Domain,
+		authoritativeNS: config.AuthoritativeNS,
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+}
+
 // --- Helper: 创建测试用 DNSClient（不启动网络连接） ---
 
 func testDNSClient(domain, connID string, maxBodySize int) *DNSClient {
@@ -127,7 +144,7 @@ func TestDNS_ResolveDNSAddr_DoT(t *testing.T) {
 }
 
 func TestDNS_ResolveDNSAddr_CustomParams(t *testing.T) {
-	addr, err := ResolveDNSAddr("doh", "doh://10.0.0.1:8443?domain=evil.com&interval=200&max=100&timeout=10&path=/custom&method=GET")
+	addr, err := ResolveDNSAddr("doh", "doh://10.0.0.1:8443?domain=evil.com&ns=ns.evil.com&interval=200&max=100&timeout=10&path=/custom&method=GET")
 	if err != nil {
 		t.Fatalf("ResolveDNSAddr error: %v", err)
 	}
@@ -135,6 +152,9 @@ func TestDNS_ResolveDNSAddr_CustomParams(t *testing.T) {
 	config := getDNSConfig(addr)
 	if config.Domain != "evil.com" {
 		t.Errorf("Domain: got %q, want %q", config.Domain, "evil.com")
+	}
+	if config.AuthoritativeNS != "ns.evil.com" {
+		t.Errorf("AuthoritativeNS: got %q, want %q", config.AuthoritativeNS, "ns.evil.com")
 	}
 	if config.Interval.Milliseconds() != 200 {
 		t.Errorf("Interval: got %dms, want 200ms", config.Interval.Milliseconds())
@@ -170,7 +190,7 @@ func TestDNS_ResolveDNSAddr_DefaultMaxBodySize(t *testing.T) {
 	}
 
 	domainLen := len("example.com")
-	available := MaxDomainLength - domainLen - 9             // connID(8) + dot(1)
+	available := MaxDomainLength - domainLen - 9 // connID(8) + dot(1)
 	b58Chars := available * MaxLabelLength / (MaxLabelLength + 1)
 	expected := int(float64(b58Chars) / 1.37)
 	if addr.maxBodySize != expected {
@@ -551,6 +571,29 @@ func TestDNS_ProcessDNSQuery_NSQuery(t *testing.T) {
 	}
 }
 
+func TestDNS_ProcessDNSQuery_NSQueryConfiguredAuthority(t *testing.T) {
+	server := testDNSServerFromURL(t, "dns://127.0.0.1:53?domain=cdn2.spacex666.tech&ns=cdn1.spacex666.tech")
+	defer server.Close()
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("cdn2.spacex666.tech.", dns.TypeNS)
+
+	resp := server.processDNSQuery(msg)
+	if resp == nil {
+		t.Fatal("Expected non-nil response")
+	}
+	if len(resp.Answer) == 0 {
+		t.Fatal("Expected NS record in answer")
+	}
+	ns, ok := resp.Answer[0].(*dns.NS)
+	if !ok {
+		t.Fatal("Expected NS record type")
+	}
+	if ns.Ns != dns.Fqdn("cdn1.spacex666.tech") {
+		t.Errorf("NS: got %q, want %q", ns.Ns, dns.Fqdn("cdn1.spacex666.tech"))
+	}
+}
+
 // ============================================================
 // 6. B58 DNS 上下文 round-trip 测试
 // ============================================================
@@ -802,8 +845,8 @@ func TestDNSBoundary_MultiLabel_Split(t *testing.T) {
 // TestDNSBoundary_DomainLength_AtLimit 查询域名恰好在 253 字符限制
 func TestDNSBoundary_DomainLength_AtLimit(t *testing.T) {
 	// 使用短域名和连接ID来最大化数据空间
-	domain := "t.co"  // 4 chars
-	connID := "c1"    // 2 chars
+	domain := "t.co" // 4 chars
+	connID := "c1"   // 2 chars
 	client := testDNSClient(domain, connID, 200)
 
 	// 可用于数据的总长度 = 253 - len(domain) - len(connID) - 2 dots
@@ -1313,6 +1356,45 @@ func TestDNS_E2E_UDP_FullRoundTrip(t *testing.T) {
 	t.Logf("Client received: %q", string(respPkt.Data))
 }
 
+func TestDNS_E2E_UDP_MultiPacketBatch(t *testing.T) {
+	server, client, addr := dnsSetupUDP(t)
+
+	clientBatch := NewSimplexPackets()
+	clientBatch.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("client-one")))
+	clientBatch.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("client-two")))
+	if _, err := client.Send(clientBatch, addr); err != nil {
+		t.Fatalf("client Send batch error: %v", err)
+	}
+
+	first, recvAddr := dnsPollServerUntilReceived(t, server, testPollTimeout)
+	second, _ := dnsPollServerUntilReceived(t, server, testPollTimeout)
+	if string(first.Data) != "client-one" {
+		t.Fatalf("server first packet = %q, want %q", string(first.Data), "client-one")
+	}
+	if string(second.Data) != "client-two" {
+		t.Fatalf("server second packet = %q, want %q", string(second.Data), "client-two")
+	}
+
+	serverBatch := NewSimplexPackets()
+	serverBatch.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("server-one")))
+	serverBatch.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("server-two")))
+	if _, err := server.Send(serverBatch, recvAddr); err != nil {
+		t.Fatalf("server Send batch error: %v", err)
+	}
+
+	if _, err := client.Send(NewSimplexPackets(), addr); err != nil {
+		t.Fatalf("client polling Send error: %v", err)
+	}
+	respFirst := dnsPollClientUntilReceived(t, client, testPollTimeout)
+	respSecond := dnsPollClientUntilReceived(t, client, testPollTimeout)
+	if string(respFirst.Data) != "server-one" {
+		t.Fatalf("client first packet = %q, want %q", string(respFirst.Data), "server-one")
+	}
+	if string(respSecond.Data) != "server-two" {
+		t.Fatalf("client second packet = %q, want %q", string(respSecond.Data), "server-two")
+	}
+}
+
 // TestDNS_E2E_MultipleClients_UDP 多客户端连接同一服务器
 func TestDNS_E2E_MultipleClients_UDP(t *testing.T) {
 	port := dnsTestPort(t)
@@ -1476,11 +1558,7 @@ func TestDNS_E2E_PollingWithPendingResponse(t *testing.T) {
 		t.Fatalf("Server.Send error: %v", err)
 	}
 
-	// Client 发送空查询来触发响应
-	emptyPkts := NewSimplexPackets()
-	emptyPkts.Append(NewSimplexPacket(SimplexPacketTypeDATA, []byte("poll")))
-	client.Send(emptyPkts, addr)
-
+	// Client Receive should issue an empty polling query to trigger response delivery.
 	respPkt := dnsPollClientUntilReceived(t, client, testPollTimeout)
 	if string(respPkt.Data) != "pending-response" {
 		t.Errorf("Client got %q, want %q", string(respPkt.Data), "pending-response")
@@ -2142,7 +2220,7 @@ func TestDNSStress_DataIntegrity_SHA256(t *testing.T) {
 		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
 			data := make([]byte, size)
 			for i := range data {
-				data[i] = byte((i * 7 + 13) % 256)
+				data[i] = byte((i*7 + 13) % 256)
 			}
 			expectedHash := sha256.Sum256(data)
 

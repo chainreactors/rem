@@ -1,6 +1,7 @@
 package trojan
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -16,6 +17,26 @@ import (
 	"github.com/chainreactors/rem/x/socks5"
 	"github.com/chainreactors/rem/x/utils"
 )
+
+func TestTrojanPluginReusesCertificate(t *testing.T) {
+	plugI, err := NewTrojanInbound(map[string]string{"password": "testpass"})
+	if err != nil {
+		t.Fatalf("NewTrojanInbound returned error: %v", err)
+	}
+
+	plug := plugI.(*TrojanPlugin)
+	first := plug.serverTLSConfig().Certificates[0]
+	second := plug.serverTLSConfig().Certificates[0]
+	if len(first.Certificate) == 0 || len(second.Certificate) == 0 {
+		t.Fatal("expected generated TLS certificate")
+	}
+	if !bytes.Equal(first.Certificate[0], second.Certificate[0]) {
+		t.Fatal("Trojan plugin regenerated its TLS certificate between connections")
+	}
+	if first.PrivateKey != second.PrivateKey {
+		t.Fatal("Trojan plugin did not reuse its TLS private key")
+	}
+}
 
 func init() {
 	if utils.Log == nil {

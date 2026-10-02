@@ -2,15 +2,18 @@ package arq
 
 import (
 	"encoding/binary"
-	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	harq "github.com/chainreactors/rem/harness/arq"
 )
 
 // === Shared test infrastructure for x/arq tests ===
+
+const ARQ_INTERVAL = 100
 
 // mockAddr is a minimal net.Addr implementation for testing.
 type mockAddr struct{ id string }
@@ -123,43 +126,24 @@ func (m *mockPacketConn) SetDeadline(t time.Time) error      { return nil }
 func (m *mockPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *mockPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// controlledPacketConn wraps mockPacketConn with write-budget backpressure.
-type controlledPacketConn struct {
-	*mockPacketConn
-	writeBudget int
-	blocked     atomic.Int32
-	tryCh       chan struct{}
-}
-
-func newControlledPacketConn(writeBudget int) *controlledPacketConn {
-	return &controlledPacketConn{
-		mockPacketConn: newMockPacketConn(),
-		writeBudget:    writeBudget,
-		tryCh:          make(chan struct{}, 32),
-	}
-}
-
-func (c *controlledPacketConn) TryWriteTo(p []byte, addr net.Addr) (int, error) {
-	select {
-	case c.tryCh <- struct{}{}:
-	default:
-	}
-	if c.blocked.Load() != 0 {
-		return 0, ErrWouldBlock
-	}
-	return c.WriteTo(p, addr)
-}
-
-func (c *controlledPacketConn) ARQWriteBudget() int {
-	return c.writeBudget
-}
-
 // makeARQDataPacket builds a raw ARQ DATA packet with the given SN and payload.
 func makeARQDataPacket(sn uint32, payload []byte) []byte {
+	return makeARQPacket(CMD_DATA, sn, 0, payload)
+}
+
+func makeARQFINPacket(sn uint32) []byte {
+	return makeARQPacket(CMD_FIN, sn, 0, nil)
+}
+
+func makeARQACKPacket(ack uint32) []byte {
+	return makeARQPacket(CMD_ACK, 0, ack, nil)
+}
+
+func makeARQPacket(cmd uint8, sn, ack uint32, payload []byte) []byte {
 	buf := make([]byte, ARQ_OVERHEAD+len(payload))
-	buf[0] = CMD_DATA
+	buf[0] = cmd
 	binary.BigEndian.PutUint32(buf[1:5], sn)
-	binary.BigEndian.PutUint32(buf[5:9], 0) // ack = 0
+	binary.BigEndian.PutUint32(buf[5:9], ack)
 	binary.BigEndian.PutUint16(buf[9:11], uint16(len(payload)))
 	copy(buf[ARQ_OVERHEAD:], payload)
 	return buf
@@ -184,23 +168,6 @@ func acceptWithTimeout(t *testing.T, l *ARQListener, timeout time.Duration) net.
 }
 
 // ---------------------------------------------------------------------------
-// nettestConn wraps net.Conn to suppress ErrCloseDrainTimeout on Close,
-// which is expected for ARQ sessions with pending data.
-// ---------------------------------------------------------------------------
-
-type nettestConn struct {
-	net.Conn
-}
-
-func (c *nettestConn) Close() error {
-	err := c.Conn.Close()
-	if errors.Is(err, ErrCloseDrainTimeout) {
-		return nil
-	}
-	return err
-}
-
-// ---------------------------------------------------------------------------
 // pipePacketConn: lossless, in-order, bidirectional PacketConn pair for testing
 // ---------------------------------------------------------------------------
 
@@ -214,7 +181,6 @@ type pipePacketConn struct {
 	closeCh      chan struct{}
 	closeOnce    *sync.Once
 	sendMu       sync.RWMutex
-	sendClose    *sync.Once
 }
 
 func newPacketPipe() (a, b *pipePacketConn) {
@@ -230,7 +196,6 @@ func newPacketPipe() (a, b *pipePacketConn) {
 		recvCh:    chBA,
 		closeCh:   make(chan struct{}),
 		closeOnce: &sync.Once{},
-		sendClose: &sync.Once{},
 	}
 	b = &pipePacketConn{
 		localAddr: addrB,
@@ -239,7 +204,6 @@ func newPacketPipe() (a, b *pipePacketConn) {
 		recvCh:    chAB,
 		closeCh:   make(chan struct{}),
 		closeOnce: &sync.Once{},
-		sendClose: &sync.Once{},
 	}
 	return a, b
 }
@@ -303,7 +267,6 @@ func (p *pipePacketConn) Close() error {
 		p.sendMu.Lock()
 		defer p.sendMu.Unlock()
 		p.closeOnce.Do(func() { close(p.closeCh) })
-		p.sendClose.Do(func() { close(p.sendCh) })
 	}
 	return nil
 }
@@ -334,15 +297,82 @@ func (p *pipePacketConn) SetWriteDeadline(t time.Time) error {
 
 func arqMakePipe() (c1, c2 net.Conn, stop func(), err error) {
 	pA, pB := newPacketPipe()
-	sessA := &nettestConn{Conn: NewARQSession(pA, pB.localAddr, 1024, 0)}
-	sessB := &nettestConn{Conn: NewARQSession(pB, pA.localAddr, 1024, 0)}
+	sessA := NewARQSession(pA, pB.localAddr, 1024, 0)
+	sessB := NewARQSession(pB, pA.localAddr, 1024, 0)
 	stop = func() {
 		sessA.Close()
 		sessB.Close()
-		// Allow background goroutines to detect close and exit
-		// before the test framework invalidates the test's t.
 		time.Sleep(50 * time.Millisecond)
 	}
 	return sessA, sessB, stop, nil
 }
 
+// ---------------------------------------------------------------------------
+// faultyPipePacketConn: wraps pipePacketConn with per-direction packet loss
+// ---------------------------------------------------------------------------
+
+var faultyCounter uint64
+
+func cheapRand() int {
+	return int(atomic.AddUint64(&faultyCounter, 6364136223846793005) >> 33)
+}
+
+type faultyPipePacketConn struct {
+	*pipePacketConn
+	dropRate int32 // atomic, 0-100
+}
+
+func (f *faultyPipePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	rate := int(atomic.LoadInt32(&f.dropRate))
+	if rate > 0 && cheapRand()%100 < rate {
+		return len(b), nil
+	}
+	return f.pipePacketConn.WriteTo(b, addr)
+}
+
+func newFaultyPacketPipe() (a, b *faultyPipePacketConn) {
+	pa, pb := newPacketPipe()
+	return &faultyPipePacketConn{pipePacketConn: pa},
+		&faultyPipePacketConn{pipePacketConn: pb}
+}
+
+// pipeFaultController implements harq.FaultController and AsymFaultController.
+type pipeFaultController struct {
+	a, b *faultyPipePacketConn
+}
+
+func (fc *pipeFaultController) SetDropRate(percent int) {
+	atomic.StoreInt32(&fc.a.dropRate, int32(percent))
+	atomic.StoreInt32(&fc.b.dropRate, int32(percent))
+}
+
+func (fc *pipeFaultController) SetPartition(active bool) {
+	if active {
+		fc.SetDropRate(100)
+	} else {
+		fc.SetDropRate(0)
+	}
+}
+
+func (fc *pipeFaultController) SetDropRateAtoB(percent int) {
+	atomic.StoreInt32(&fc.a.dropRate, int32(percent))
+}
+
+func (fc *pipeFaultController) SetDropRateBtoA(percent int) {
+	atomic.StoreInt32(&fc.b.dropRate, int32(percent))
+}
+
+func arqMakeFaultyPipe(t *testing.T) (c1, c2 net.Conn, faults harq.FaultController, stop func(), err error) {
+	t.Helper()
+	fA, fB := newFaultyPacketPipe()
+	cfg := ARQConfig{MTU: 1024, RTO: 500, MaxRetransmissions: 30}
+	sessA := NewARQSessionWithConfig(fA, fB.localAddr, cfg)
+	sessB := NewARQSessionWithConfig(fB, fA.localAddr, cfg)
+	fc := &pipeFaultController{a: fA, b: fB}
+	stop = func() {
+		sessA.Close()
+		sessB.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	return sessA, sessB, fc, stop, nil
+}

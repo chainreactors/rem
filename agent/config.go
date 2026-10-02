@@ -16,7 +16,7 @@ const (
 
 var (
 	KeepaliveInterval  = 60 * time.Second // client sends ping every interval
-	KeepaliveMaxMissed = 10               // consecutive unanswered pings before declaring dead
+	KeepaliveMaxMissed = 3                // consecutive unanswered pings before declaring dead
 )
 
 var (

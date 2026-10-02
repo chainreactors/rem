@@ -12,7 +12,7 @@ import (
 
 // TestARQReordering tests ARQ with severe packet reordering
 func TestARQReordering(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Create packets 0-9
 	packets := make([][]byte, 10)
@@ -53,7 +53,7 @@ func TestARQBurstySend(t *testing.T) {
 		atomic.AddInt32(&outputCount, 1)
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send in bursts
 	for burst := 0; burst < 5; burst++ {
@@ -92,7 +92,7 @@ func TestARQDuplicateNACK(t *testing.T) {
 		mu.Unlock()
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send data
 	arq.Send([]byte("test"))
@@ -133,7 +133,7 @@ func TestARQDuplicateNACK(t *testing.T) {
 
 // TestARQMalformedPackets tests handling of malformed packets
 func TestARQMalformedPackets(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	testCases := []struct {
 		name string
@@ -168,7 +168,7 @@ func TestARQRapidUpdateCalls(t *testing.T) {
 		atomic.AddInt32(&outputCount, 1)
 	}
 
-	arq := NewSimpleARQ(1, output)
+	arq := NewSimpleARQ(output)
 
 	// Send some data
 	for i := 0; i < 10; i++ {
@@ -191,7 +191,7 @@ func TestARQRapidUpdateCalls(t *testing.T) {
 
 // TestARQConcurrentInputUpdate tests concurrent Input and Update calls
 func TestARQConcurrentInputUpdate(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	var wg sync.WaitGroup
 	duration := 1 * time.Second
@@ -254,7 +254,7 @@ func TestARQConcurrentInputUpdate(t *testing.T) {
 
 // TestARQMemoryLeak tests for potential memory leaks in send buffer
 func TestARQMemoryLeak(t *testing.T) {
-	arq := NewSimpleARQ(1, func([]byte) {})
+	arq := NewSimpleARQ(func([]byte) {})
 
 	// Send many packets
 	for i := 0; i < 1000; i++ {
@@ -281,7 +281,7 @@ func TestARQMemoryLeak(t *testing.T) {
 // TestARQZeroMTU tests ARQ with invalid MTU
 func TestARQZeroMTU(t *testing.T) {
 	// Should use default MTU
-	arq := NewSimpleARQWithMTU(1, func([]byte) {}, 0, 0)
+	arq := NewSimpleARQWithMTU(func([]byte) {}, 0)
 
 	if arq.mtu != ARQ_MTU {
 		t.Errorf("Expected default MTU %d, got %d", ARQ_MTU, arq.mtu)
@@ -296,7 +296,7 @@ func TestARQZeroMTU(t *testing.T) {
 // TestARQNegativeMTU tests ARQ with negative MTU
 func TestARQNegativeMTU(t *testing.T) {
 	// Should use default MTU
-	arq := NewSimpleARQWithMTU(1, func([]byte) {}, -100, 0)
+	arq := NewSimpleARQWithMTU(func([]byte) {}, -100)
 
 	if arq.mtu != ARQ_MTU {
 		t.Errorf("Expected default MTU %d, got %d", ARQ_MTU, arq.mtu)
@@ -345,7 +345,7 @@ func newSlowNetwork(packetInterval, oneWayDelay time.Duration) *slowNetwork {
 	}
 
 	// 创建 sender ARQ, 输出到 forwardQueue
-	net.senderARQ = NewSimpleARQ(1, func(data []byte) {
+	net.senderARQ = NewSimpleARQ(func(data []byte) {
 		net.mu.Lock()
 		defer net.mu.Unlock()
 
@@ -372,7 +372,7 @@ func newSlowNetwork(packetInterval, oneWayDelay time.Duration) *slowNetwork {
 	})
 
 	// 创建 receiver ARQ, 输出到 reverseQueue (NACK 通道)
-	net.receiverARQ = NewSimpleARQ(1, func(data []byte) {
+	net.receiverARQ = NewSimpleARQ(func(data []byte) {
 		net.mu.Lock()
 		defer net.mu.Unlock()
 

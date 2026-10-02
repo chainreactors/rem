@@ -126,7 +126,6 @@ func (s *retryTestSimplex) WaitAttempt(timeout time.Duration) bool {
 func newTestSimplexClientWrapper(sx Simplex, addr *SimplexAddr) *SimplexClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	buf := NewSimplexBuffer(addr)
-	buf.EnableDataBudget(addr.MaxBodySize())
 	client := &SimplexClient{
 		Simplex: sx,
 		buf:     buf,
@@ -292,26 +291,6 @@ func TestSimplexServerPreemptsPendingDataForControlPackets(t *testing.T) {
 	}
 }
 
-func TestSimplexClientTryWriteToBackpressuresDataButAllowsControl(t *testing.T) {
-	addr := newTestSimplexAddr(time.Hour, 64)
-	sx := newRetryTestSimplex(addr, 0)
-	client := newTestSimplexClientWrapperWithCtrl(sx, addr, func(data []byte) bool {
-		return bytes.HasPrefix(data, []byte("ctrl:"))
-	})
-	defer client.Close()
-
-	dataPayload := bytes.Repeat([]byte("d"), 48)
-	if _, err := client.TryWriteTo(dataPayload, addr); err != nil {
-		t.Fatalf("first TryWriteTo(data) failed: %v", err)
-	}
-	if _, err := client.TryWriteTo(dataPayload, addr); !errors.Is(err, arq.ErrWouldBlock) {
-		t.Fatalf("second TryWriteTo(data) = %v, want %v", err, arq.ErrWouldBlock)
-	}
-	if _, err := client.TryWriteTo([]byte("ctrl:ack"), addr); err != nil {
-		t.Fatalf("TryWriteTo(ctrl) failed while data credit was exhausted: %v", err)
-	}
-}
-
 func TestSimplexClientFailsTransportAfterAcceptanceStall(t *testing.T) {
 	addr := newRetryTestSimplexAddrWithARQ(10*time.Millisecond, arq.ARQConfig{
 		MTU:                128,
@@ -334,8 +313,8 @@ func TestSimplexClientFailsTransportAfterAcceptanceStall(t *testing.T) {
 	if err := client.transportFailure(); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("transportFailure = %v, want io.ErrClosedPipe", err)
 	}
-	if _, err := client.TryWriteTo([]byte("after-stall"), addr); !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("TryWriteTo after stalled transport = %v, want %v", err, io.ErrClosedPipe)
+	if _, err := client.WriteTo([]byte("after-stall"), addr); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("WriteTo after stalled transport = %v, want %v", err, io.ErrClosedPipe)
 	}
 }
 
@@ -549,19 +528,29 @@ func TestSimplexClientClose_UnblocksReadFromAndStopsPolling(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 
-	if n, _, err := client.ReadFrom(make([]byte, 64)); n != 0 || err != nil {
-		t.Fatalf("empty ReadFrom before Close = (%d, %v), want (0, nil)", n, err)
+	client.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	if n, _, err := client.ReadFrom(make([]byte, 64)); n != 0 || err == nil {
+		t.Fatalf("ReadFrom with deadline before Close = (%d, %v), want timeout", n, err)
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("ReadFrom with deadline error = %v, want timeout net.Error", err)
 	}
-
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
+	client.SetReadDeadline(time.Time{})
 
 	readDone := make(chan error, 1)
 	go func() {
 		_, _, err := client.ReadFrom(make([]byte, 64))
 		readDone <- err
 	}()
+
+	select {
+	case err := <-readDone:
+		t.Fatalf("ReadFrom returned before Close: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	select {
 	case err := <-readDone:
@@ -580,5 +569,87 @@ func TestSimplexClientClose_UnblocksReadFromAndStopsPolling(t *testing.T) {
 
 	if transport.closeCalls.Load() != 1 {
 		t.Fatalf("underlying transport Close calls = %d, want 1", transport.closeCalls.Load())
+	}
+}
+
+func TestSimplexServerReadFrom_BlocksUntilDataDeadlineAndClose(t *testing.T) {
+	addr := newTestSimplexAddr(20*time.Millisecond, 4096)
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &SimplexServer{
+		recvCh: make(chan recvEntry, 1),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	type readResult struct {
+		n    int
+		addr net.Addr
+		err  error
+		data []byte
+	}
+
+	readDone := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, raddr, err := server.ReadFrom(buf)
+		readDone <- readResult{n: n, addr: raddr, err: err, data: append([]byte(nil), buf[:n]...)}
+	}()
+
+	select {
+	case result := <-readDone:
+		t.Fatalf("ReadFrom returned before data/close: %+v", result)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	server.recvCh <- recvEntry{data: []byte("server-packet"), addr: addr}
+
+	select {
+	case result := <-readDone:
+		if result.err != nil {
+			t.Fatalf("ReadFrom returned error: %v", result.err)
+		}
+		if result.n != len("server-packet") {
+			t.Fatalf("ReadFrom n = %d, want %d", result.n, len("server-packet"))
+		}
+		if string(result.data) != "server-packet" {
+			t.Fatalf("ReadFrom data = %q, want %q", string(result.data), "server-packet")
+		}
+		if result.addr != addr {
+			t.Fatalf("ReadFrom addr = %v, want %v", result.addr, addr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadFrom did not return after packet arrival")
+	}
+
+	server.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	if n, _, err := server.ReadFrom(make([]byte, 64)); n != 0 || err == nil {
+		t.Fatalf("ReadFrom with deadline = (%d, %v), want timeout", n, err)
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("ReadFrom with deadline error = %v, want timeout net.Error", err)
+	}
+	server.SetReadDeadline(time.Time{})
+
+	readDone = make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, raddr, err := server.ReadFrom(buf)
+		readDone <- readResult{n: n, addr: raddr, err: err, data: append([]byte(nil), buf[:n]...)}
+	}()
+
+	select {
+	case result := <-readDone:
+		t.Fatalf("ReadFrom returned before cancel: %+v", result)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	cancel()
+
+	select {
+	case result := <-readDone:
+		if !errors.Is(result.err, io.ErrClosedPipe) {
+			t.Fatalf("ReadFrom after cancel = %v, want %v", result.err, io.ErrClosedPipe)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadFrom remained blocked after cancel")
 	}
 }
