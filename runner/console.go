@@ -20,9 +20,13 @@ import (
 
 func NewConsole(runner *RunnerConfig, urls *core.URLs) (*Console, error) {
 	var err error
+	runner.scopeOnce.Do(func() {
+		runner.scope = &consoleScope{owned: make(map[string]*agent.Agent)}
+	})
 	console := &Console{
 		URLs:    urls,
 		Config:  runner,
+		scope:   runner.scope,
 		pending: make(map[string]*pendingPair),
 	}
 
@@ -66,9 +70,8 @@ type Console struct {
 	*core.URLs
 	sub        *core.URL
 	tunnel     *tunnel.TunnelService
+	scope      *consoleScope
 	closed     bool
-	ownerMu    sync.Mutex
-	owned      map[string]*agent.Agent
 	closeDone  chan struct{}
 	closeError error
 
@@ -598,33 +601,33 @@ func (c *Console) Handler(server *agent.Agent) {
 	server.Close(err)
 	// Delete agent immediately after Handler returns, before defer cleanup
 	agent.Agents.CompareAndDelete(server.ID, server)
-	c.ownerMu.Lock()
-	if c.owned[server.ID] == server {
-		delete(c.owned, server.ID)
+	c.scope.mu.Lock()
+	if c.scope.owned[server.ID] == server {
+		delete(c.scope.owned, server.ID)
 	}
-	c.ownerMu.Unlock()
+	c.scope.mu.Unlock()
 }
 
 func (c *Console) Close() error {
-	c.ownerMu.Lock()
+	c.scope.mu.Lock()
 	if c.closed {
 		done := c.closeDone
-		c.ownerMu.Unlock()
+		c.scope.mu.Unlock()
 		if done != nil {
 			<-done
 		}
-		c.ownerMu.Lock()
+		c.scope.mu.Lock()
 		err := c.closeError
-		c.ownerMu.Unlock()
+		c.scope.mu.Unlock()
 		return err
 	}
 	c.closed = true
 	c.closeDone = make(chan struct{})
-	owned := make([]*agent.Agent, 0, len(c.owned))
-	for _, a := range c.owned {
+	owned := make([]*agent.Agent, 0, len(c.scope.owned))
+	for _, a := range c.scope.owned {
 		owned = append(owned, a)
 	}
-	c.ownerMu.Unlock()
+	c.scope.mu.Unlock()
 	c.stopPendingReaper()
 	c.pendingMu.Lock()
 	for _, pair := range c.pending {
@@ -645,10 +648,10 @@ func (c *Console) Close() error {
 	if c.tunnel != nil {
 		err = c.tunnel.Close()
 	}
-	c.ownerMu.Lock()
+	c.scope.mu.Lock()
 	c.closeError = err
 	close(c.closeDone)
-	c.ownerMu.Unlock()
+	c.scope.mu.Unlock()
 	return err
 }
 

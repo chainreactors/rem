@@ -106,6 +106,9 @@ type RunnerConfig struct {
 	IsServerMode    bool        // true if using -s/--server, false if using -c/--client
 	IsRelayMode     bool        // true if both -c and -s are specified
 	RelayListenURLs []*core.URL // -s addresses used for relay listening
+
+	scopeOnce sync.Once
+	scope     *consoleScope
 }
 
 func (r *RunnerConfig) NewURLs(con *core.URL) *core.URLs {
