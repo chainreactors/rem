@@ -20,9 +20,13 @@ import (
 
 func NewConsole(runner *RunnerConfig, urls *core.URLs) (*Console, error) {
 	var err error
+	runner.scopeOnce.Do(func() {
+		runner.scope = &consoleScope{owned: make(map[string]*agent.Agent)}
+	})
 	console := &Console{
 		URLs:    urls,
 		Config:  runner,
+		scope:   runner.scope,
 		pending: make(map[string]*pendingPair),
 	}
 
@@ -64,9 +68,12 @@ type Console struct {
 	Config *RunnerConfig
 	token  string
 	*core.URLs
-	sub    *core.URL
-	tunnel *tunnel.TunnelService
-	closed bool
+	sub        *core.URL
+	tunnel     *tunnel.TunnelService
+	scope      *consoleScope
+	closed     bool
+	closeDone  chan struct{}
+	closeError error
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingPair
@@ -124,10 +131,10 @@ func (c *Console) Run() error {
 
 		utils.Log.Importantf("%s channel starting with %s", c.ConsoleURL.Scheme, c.Config.IP)
 		utils.Log.Important(c.Link())
-		for !c.closed {
+		for !c.isClosed() {
 			age, err := c.Accept()
 			if err != nil {
-				if c.closed {
+				if c.isClosed() {
 					return nil
 				}
 				utils.Log.Error(err.Error())
@@ -145,6 +152,9 @@ func (c *Console) Run() error {
 		consecutiveDialFailures := 0
 
 		for {
+			if c.isClosed() {
+				return nil
+			}
 			age, err := c.Dial(c.ConsoleURL)
 			if err == nil && c.Config.IsRelayMode && !c.relayStarted {
 				c.relayStarted = true
@@ -210,7 +220,10 @@ func (c *Console) Dial(address *core.URL) (*agent.Agent, error) {
 		a.Close(err)
 		return nil, err
 	}
-	agent.Agents.Add(a)
+	if err := c.registerAgent(a); err != nil {
+		a.Close(err)
+		return nil, err
+	}
 
 	// Initialize yamux session and start background loops before forking.
 	// Both are idempotent (HandlerInit checks Init flag, StartBackgroundLoops uses sync.Once).
@@ -245,7 +258,10 @@ func (c *Console) Dial(address *core.URL) (*agent.Agent, error) {
 			Remote:      ctrl.Remote,
 			Fork:        true,
 		})
-		agent.Agents.Add(forked)
+		if err := c.registerAgent(forked); err != nil {
+			forked.Close(err)
+			return nil, err
+		}
 	}
 
 	return a, nil
@@ -299,7 +315,10 @@ func (c *Console) DialDirectionalPair(upURL, downURL *core.URL) (*agent.Agent, e
 		dc.Close()
 		return nil, err
 	}
-	agent.Agents.Add(a)
+	if err := c.registerAgent(a); err != nil {
+		a.Close(err)
+		return nil, err
+	}
 	return a, nil
 }
 
@@ -317,7 +336,7 @@ func (c *Console) Fork(raw string, args []string) (*agent.Agent, error) {
 		r.Alias = utils.RandomString(8)
 	}
 
-	a, ok := agent.Agents.Get(raw)
+	a, ok := c.Agent(raw)
 	if !ok {
 		return nil, fmt.Errorf("not found agent")
 	}
@@ -340,7 +359,10 @@ func (c *Console) Fork(raw string, args []string) (*agent.Agent, error) {
 		Remote:      r.URLs.RemoteURL.String(),
 		Fork:        true,
 	})
-	agent.Agents.Add(forked)
+	if err := c.registerAgent(forked); err != nil {
+		forked.Close(err)
+		return nil, err
+	}
 	return forked, nil
 }
 
@@ -416,9 +438,13 @@ func (c *Console) finishAccept(conn net.Conn, login *message.Login) (*agent.Agen
 	cio.WriteMsg(conn, &message.Ack{Status: message.StatusSuccess})
 	control := controlMsg.(*message.Control)
 	if old, ok := agent.Agents.Get(login.Agent); ok {
+		if !c.owns(old) {
+			_ = conn.Close()
+			return nil, fmt.Errorf("agent identity %s belongs to another console", login.Agent)
+		}
 		utils.Log.Warnf("[connhub] id=%s replacing existing session by new login/control", login.Agent)
 		old.Close(fmt.Errorf("replaced by new login/control"))
-		agent.Agents.Delete(old.ID)
+		agent.Agents.CompareAndDelete(old.ID, old)
 	}
 
 	server, err := agent.NewAgent(&agent.Config{
@@ -461,7 +487,10 @@ func (c *Console) finishAccept(conn net.Conn, login *message.Login) (*agent.Agen
 	}
 	utils.Log.Importantf("%s:%s %s connected from %s, iface: %v%s",
 		server.Hostname, server.Username, server.Name(), conn.RemoteAddr().String(), server.Interfaces, viaInfo)
-	agent.Agents.Add(server)
+	if err := c.registerAgent(server); err != nil {
+		server.Close(err)
+		return nil, err
+	}
 	return server, nil
 }
 
@@ -469,11 +498,11 @@ func (c *Console) attachConnToAgent(agentID, label string, conn net.Conn) error 
 	if label == "" {
 		return fmt.Errorf("attach requires non-empty role id")
 	}
-	a, ok := agent.Agents.Get(agentID)
+	a, ok := c.Agent(agentID)
 	if !ok {
 		return fmt.Errorf("agent %s not found for channel attach", agentID)
 	}
-	if a.Closed {
+	if a.IsClosed() {
 		return fmt.Errorf("agent %s closed for channel attach", agentID)
 	}
 	return a.AttachConn(conn, label)
@@ -571,11 +600,34 @@ func (c *Console) Handler(server *agent.Agent) {
 	}
 	server.Close(err)
 	// Delete agent immediately after Handler returns, before defer cleanup
-	agent.Agents.Delete(server.ID)
+	agent.Agents.CompareAndDelete(server.ID, server)
+	c.scope.mu.Lock()
+	if c.scope.owned[server.ID] == server {
+		delete(c.scope.owned, server.ID)
+	}
+	c.scope.mu.Unlock()
 }
 
 func (c *Console) Close() error {
+	c.scope.mu.Lock()
+	if c.closed {
+		done := c.closeDone
+		c.scope.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		c.scope.mu.Lock()
+		err := c.closeError
+		c.scope.mu.Unlock()
+		return err
+	}
 	c.closed = true
+	c.closeDone = make(chan struct{})
+	owned := make([]*agent.Agent, 0, len(c.scope.owned))
+	for _, a := range c.scope.owned {
+		owned = append(owned, a)
+	}
+	c.scope.mu.Unlock()
 	c.stopPendingReaper()
 	c.pendingMu.Lock()
 	for _, pair := range c.pending {
@@ -588,14 +640,19 @@ func (c *Console) Close() error {
 	}
 	c.pending = map[string]*pendingPair{}
 	c.pendingMu.Unlock()
-	agent.Agents.Range(func(key, value interface{}) bool {
-		value.(*agent.Agent).Close(nil)
-		// Remove closed agents immediately so a fast same-alias reconnect
-		// cannot trip the duplicate-ID guard in agent.NewAgent.
-		agent.Agents.Delete(key)
-		return true
-	})
-	return c.tunnel.Close()
+	for _, a := range owned {
+		a.Close(nil)
+		agent.Agents.CompareAndDelete(a.ID, a)
+	}
+	var err error
+	if c.tunnel != nil {
+		err = c.tunnel.Close()
+	}
+	c.scope.mu.Lock()
+	c.closeError = err
+	close(c.closeDone)
+	c.scope.mu.Unlock()
+	return err
 }
 
 func (c *Console) Link() string {
