@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os/user"
 	"strings"
-	"time"
 
 	"github.com/chainreactors/logs"
 	"github.com/chainreactors/proxyclient"
@@ -46,11 +45,13 @@ func newRemProxyClient(proxyURL *url.URL, _ proxyclient.Dial) (proxyclient.Dial,
 			}
 		}()
 
-		for {
-			if a.Init {
-				break
+		// Never wait forever: a HandlerInit failure closes the agent
+		// without setting Init.
+		if !a.WaitInit(initWaitTimeout) {
+			if !a.IsClosed() {
+				a.Close(fmt.Errorf("agent init timeout"))
 			}
-			time.Sleep(100 * time.Millisecond)
+			return nil, fmt.Errorf("rem agent failed to initialize")
 		}
 		memURL := &url.URL{
 			Scheme: "memory",

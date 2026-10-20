@@ -288,6 +288,23 @@ func (agent *Agent) Handler() error {
 	return agent.handleMessage()
 }
 
+// WaitInit blocks until the agent finishes synchronous handler init, is
+// closed, or the timeout elapses, and reports whether Init was reached.
+// A HandlerInit failure closes the agent without ever setting Init, so
+// waiting on Init alone would block the caller forever.
+func (agent *Agent) WaitInit(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if agent.Init {
+			return true
+		}
+		if agent.IsClosed() || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // StartBackgroundLoops starts the monitor and stream acceptor goroutines.
 // Safe to call multiple times (uses sync.Once internally).
 func (agent *Agent) StartBackgroundLoops() {

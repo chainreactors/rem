@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/chainreactors/rem/agent"
 	"github.com/chainreactors/rem/protocol/core"
@@ -13,6 +14,10 @@ import (
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/kballard/go-shellquote"
 )
+
+// initWaitTimeout bounds how long client-side callers wait for a dialed
+// agent to finish synchronous handler init before failing.
+const initWaitTimeout = 30 * time.Second
 
 func NewConsoleWithCMD(cmdline string) (*Console, error) {
 	var option Options

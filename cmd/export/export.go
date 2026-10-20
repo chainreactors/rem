@@ -7,6 +7,7 @@ package main
 import "C"
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -22,6 +23,10 @@ import (
 	"github.com/chainreactors/rem/x/utils"
 	"github.com/kballard/go-shellquote"
 )
+
+// initWaitTimeout bounds how long RemDial waits for the dialed agent to
+// finish synchronous handler init before failing the call.
+const initWaitTimeout = 30 * time.Second
 
 func init() {
 	utils.Log = logs.NewLogger(100)
@@ -84,19 +89,24 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 			utils.Log.Errorf("[rem] handler exited: %v", err)
 		}
 		a.Close(err)
-		agent.Agents.Map.Delete(a.ID)
+		// CompareAndDelete (not an unconditional Delete): a same-alias agent
+		// from a later RemDial may have registered after Close ran, and its
+		// registry entry must not be evicted.
+		agent.Agents.CompareAndDelete(a.ID, a)
 		// Do NOT reconnect here — the caller (malefic Rust) manages
 		// reconnection by re-calling RemDial. Having two reconnection
 		// loops (Go + Rust) causes competing agents that kill each
 		// other's memory listeners via CreateChannel race.
 	}()
 
-	for {
-		if a.Init {
-			break
-		} else {
-			time.Sleep(100 * time.Millisecond)
+	// Wait for synchronous init, but never wait forever: a HandlerInit
+	// failure (e.g. the local endpoint is already bound by another agent
+	// in this process) closes the agent without setting Init.
+	if !a.WaitInit(initWaitTimeout) {
+		if !a.IsClosed() {
+			a.Close(fmt.Errorf("agent init timeout"))
 		}
+		return nil, ErrDialFailed
 	}
 
 	return C.CString(a.ID), 0
